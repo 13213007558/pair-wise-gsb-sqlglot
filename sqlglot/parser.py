@@ -8487,6 +8487,21 @@ class Parser:
         path = self._match_text_seq("PATH") and self._parse_string()
         nested_schema = nested and self._parse_json_schema()
 
+        on_empty = None
+        on_error = None
+        if not nested:
+            for _ in range(2):
+                if on_empty is None and (
+                    empty := self._parse_on_handling("EMPTY", "ERROR", "NULL")
+                ):
+                    on_empty = empty
+                elif on_error is None and (
+                    error := self._parse_on_handling("ERROR", "ERROR", "NULL")
+                ):
+                    on_error = error
+                else:
+                    break
+
         return self.expression(
             exp.JSONColumnDef(
                 this=this,
@@ -8495,6 +8510,8 @@ class Parser:
                 nested_schema=nested_schema,
                 ordinality=ordinality,
                 format_json=format_json,
+                on_empty=on_empty,
+                on_error=on_error,
             )
         )
 

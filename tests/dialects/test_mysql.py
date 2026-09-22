@@ -401,6 +401,9 @@ class TestMySQL(Validator):
             "SELECT * FROM source, JSON_TABLE(source.links, '$.org[*]' COLUMNS(row_id FOR ORDINALITY, link VARCHAR(255) PATH '$.link')) AS links"
         )
         self.validate_identity(
+            "SELECT * FROM source, JSON_TABLE(source.links, '$.org[*]' COLUMNS(row_id FOR ORDINALITY, link VARCHAR(255) PATH '$.link' NULL ON EMPTY DEFAULT 'err' ON ERROR)) AS links"
+        )
+        self.validate_identity(
             "SELECT * FROM x ORDER BY BINARY a", "SELECT * FROM x ORDER BY CAST(a AS BINARY)"
         )
         self.validate_identity(

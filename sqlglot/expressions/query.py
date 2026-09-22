@@ -2063,6 +2063,8 @@ class JSONColumnDef(Expression):
         "nested_schema": False,
         "ordinality": False,
         "format_json": False,
+        "on_empty": False,
+        "on_error": False,
     }
 
 

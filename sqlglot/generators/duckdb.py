@@ -656,6 +656,193 @@ def _json_format_sql(self: DuckDBGenerator, expression: exp.JSONFormat) -> str:
     return f"CAST({sql} AS TEXT)"
 
 
+# Matches a simple JSON path such as '$', '$.a.b' or '$.a[0].b', i.e. the subset of MySQL
+# JSON_TABLE paths that maps directly to a DuckDB JSON path.
+_SIMPLE_JSON_PATH = re.compile(r"^\$(?:\.[A-Za-z0-9_]+|\[\d+\])*$")
+
+
+def _json_table_explode_path(
+    self: DuckDBGenerator, path: exp.Expr | None, clause: str
+) -> str | None:
+    """Strips the trailing [*] of a JSON_TABLE row/NESTED path for use with JSON_EACH."""
+    if not isinstance(path, exp.Literal) or not path.is_string:
+        self.unsupported(f"JSON_TABLE: {clause} path must be a string literal")
+        return None
+
+    explode_path = path.name
+    if not explode_path.endswith("[*]"):
+        self.unsupported(f"JSON_TABLE: {clause} path must end with [*], got '{explode_path}'")
+        return None
+
+    explode_path = explode_path[:-3] or "$"
+    if not _SIMPLE_JSON_PATH.match(explode_path):
+        self.unsupported(f"JSON_TABLE: unsupported {clause} path '{path.name}'")
+        return None
+
+    return explode_path
+
+
+def _json_table_on_handling(
+    self: DuckDBGenerator,
+    handling: exp.Expr | str | None,
+    clause: str,
+    column: str,
+    kind: exp.DataType,
+) -> exp.Expr | None:
+    """Builds the expression to use when a JSON_TABLE column's ON <clause> condition triggers."""
+    if handling is None or handling == f"NULL ON {clause}":
+        return exp.null()
+
+    if isinstance(handling, str):
+        self.unsupported(f"JSON_TABLE: {handling} is not supported for column '{column}'")
+        return None
+
+    is_literal = isinstance(handling, exp.Literal) or (
+        isinstance(handling, exp.Neg) and isinstance(handling.this, exp.Literal)
+    )
+    if not is_literal:
+        self.unsupported(
+            f"JSON_TABLE: only literal DEFAULT ... ON {clause} is supported for column '{column}'"
+        )
+        return None
+
+    return exp.Cast(this=handling.copy(), to=kind.copy())
+
+
+def _json_table_column(
+    self: DuckDBGenerator,
+    column_def: exp.JSONColumnDef,
+    source_alias: str,
+    nested: bool,
+) -> exp.Expr | None:
+    """Builds the SELECT expression for a JSON_TABLE column, reading JSON_EACH's key/value."""
+    name = column_def.this
+
+    if column_def.args.get("ordinality"):
+        # JSON_EACH's key is the 0-based array index, JSON_TABLE ordinality is 1-based
+        return (exp.cast(exp.column("key", table=source_alias), "BIGINT") + 1).as_(name.copy())
+
+    kind = column_def.args.get("kind")
+    path = column_def.args.get("path")
+    if kind is None or not isinstance(path, exp.Literal) or not path.is_string:
+        self.unsupported(f"JSON_TABLE: unsupported column definition for '{name.name}'")
+        return None
+
+    column_path = path.name
+    if not _SIMPLE_JSON_PATH.match(column_path):
+        self.unsupported(f"JSON_TABLE: unsupported path '{column_path}' for column '{name.name}'")
+        return None
+
+    if kind.is_type(*exp.DataType.TEXT_TYPES):
+        # DuckDB parses but ignores VARCHAR length modifiers, so drop them for canonical output
+        kind = exp.DataType(this=kind.this)
+
+    on_empty = _json_table_on_handling(
+        self, column_def.args.get("on_empty"), "EMPTY", name.name, kind
+    )
+    on_error = _json_table_on_handling(
+        self, column_def.args.get("on_error"), "ERROR", name.name, kind
+    )
+    if on_empty is None or on_error is None:
+        return None
+
+    value = exp.column("value", table=source_alias)
+    json_path = exp.Literal.string(column_path)
+    json_type = exp.func("JSON_TYPE", value.copy(), json_path.copy())
+    extracted = exp.JSONExtract(this=value.copy(), expression=json_path.copy())
+
+    scalar = (
+        exp.case()
+        # The path is missing: ON EMPTY
+        .when(json_type.copy().is_(exp.Null()), on_empty)
+        # The value is JSON null: SQL NULL, without triggering ON EMPTY/ON ERROR
+        .when(json_type.copy().eq(exp.Literal.string("NULL")), exp.null())
+        # Objects/arrays can't be stored in a scalar column: ON ERROR
+        .when(
+            exp.In(
+                this=json_type.copy(),
+                expressions=[exp.Literal.string("OBJECT"), exp.Literal.string("ARRAY")],
+            ),
+            on_error.copy(),
+        )
+        # The value can't be converted to the column type: ON ERROR
+        .when(
+            exp.TryCast(this=extracted.copy(), to=kind.copy()).is_(exp.Null()),
+            on_error.copy(),
+        )
+        .else_(exp.Cast(this=extracted.copy(), to=kind.copy()))
+    )
+
+    if nested:
+        # An empty/missing NESTED PATH array behaves like a LEFT JOIN: nested columns are NULL
+        scalar = (
+            exp.case()
+            .when(exp.column("key", table=source_alias).is_(exp.Null()), exp.null())
+            .else_(scalar)
+        )
+
+    return scalar.as_(name.copy())
+
+
+def _json_table_to_lateral(self: DuckDBGenerator, expression: exp.JSONTable) -> exp.Lateral | None:
+    """Transpiles a MySQL-style JSON_TABLE into an equivalent DuckDB LATERAL subquery.
+
+    Supported subset: scalar PATH columns, FOR ORDINALITY columns and a single level of
+    NESTED PATH, with NULL or literal DEFAULT ON EMPTY/ON ERROR handling. The input AST
+    is only read, never mutated, so it can still be generated for other dialects.
+    """
+    if expression.args.get("error_handling") or expression.args.get("empty_handling"):
+        self.unsupported("JSON_TABLE: table-level ON EMPTY/ON ERROR clauses are not supported")
+        return None
+
+    schema = expression.args.get("schema")
+    column_defs = schema.expressions if schema else []
+    if not column_defs:
+        self.unsupported("JSON_TABLE: missing COLUMNS clause")
+        return None
+
+    row_path = _json_table_explode_path(self, expression.args.get("path"), "row")
+    if row_path is None:
+        return None
+
+    row_alias = "_jt"
+    unnest = exp.func("JSON_EACH", expression.this.copy(), exp.Literal.string(row_path))
+    row_source = exp.Table(this=unnest, alias=exp.TableAlias(this=exp.to_identifier(row_alias)))
+    query = exp.Select().from_(row_source)
+
+    selects: list[exp.Expr] = []
+    for index, column_def in enumerate(column_defs):
+        nested_schema = column_def.args.get("nested_schema")
+
+        if nested_schema is None:
+            source_alias, nested = row_alias, False
+            defs = [column_def]
+        else:
+            nested_path = _json_table_explode_path(self, column_def.args.get("path"), "NESTED")
+            if nested_path is None:
+                return None
+
+            source_alias, nested = f"_jt_{index}", True
+            defs = nested_schema.expressions
+            if any(d.args.get("nested_schema") is not None for d in defs):
+                self.unsupported("JSON_TABLE: only one level of NESTED PATH is supported")
+                return None
+
+            nested_unnest = exp.func(
+                "JSON_EACH", exp.column("value", table=row_alias), exp.Literal.string(nested_path)
+            )
+            lateral = exp.Lateral(this=exp.select("*").from_(nested_unnest).subquery(source_alias))
+            query = query.join(exp.Join(this=lateral, kind="LEFT", on=exp.true()))
+
+        for column_def_or_nested in defs:
+            column = _json_table_column(self, column_def_or_nested, source_alias, nested)
+            if column is None:
+                return None
+            selects.append(column)
+
+    return exp.Lateral(this=query.select(*selects).subquery())
+
+
 def _build_seq_expression(base: exp.Expr, byte_width: int, signed: bool) -> exp.Expr:
     """Build a SEQ expression with the given base, byte width, and signedness."""
     bits = byte_width * 8
@@ -2307,6 +2494,13 @@ class DuckDBGenerator(generator.Generator):
             expression.set("expressions", None)
 
         return super().datatype_sql(expression)
+
+    def jsontable_sql(self, expression: exp.JSONTable) -> str:
+        lateral = _json_table_to_lateral(self, expression)
+        if lateral is None:
+            return super().jsontable_sql(expression)
+
+        return self.sql(lateral)
 
     def _array_bag_sql(self, condition: exp.Expr, arr1: exp.Expr, arr2: exp.Expr) -> str:
         cond = exp.Paren(this=exp.replace_placeholders(condition, arr1=arr1, arr2=arr2))

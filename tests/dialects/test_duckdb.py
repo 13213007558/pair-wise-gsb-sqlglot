@@ -1,6 +1,6 @@
 from unittest import mock
 
-from sqlglot import ParseError, UnsupportedError, exp, parse_one
+from sqlglot import ErrorLevel, ParseError, UnsupportedError, exp, parse_one
 from sqlglot.generator import logger as generator_logger
 from sqlglot.helper import logger as helper_logger
 from sqlglot.optimizer.annotate_types import annotate_types
@@ -3017,3 +3017,74 @@ class TestDuckDB(Validator):
                 "snowflake": "SELECT TO_VARIANT('1')",
             },
         )
+
+    def test_json_table(self):
+        self.validate_all(
+            "SELECT * FROM source, LATERAL (SELECT CAST(_jt.key AS BIGINT) + 1 AS row_id, "
+            "CASE WHEN JSON_TYPE(_jt.value, '$.link') IS NULL THEN NULL "
+            "WHEN JSON_TYPE(_jt.value, '$.link') = 'NULL' THEN NULL "
+            "WHEN JSON_TYPE(_jt.value, '$.link') IN ('OBJECT', 'ARRAY') THEN NULL "
+            "WHEN TRY_CAST(_jt.value -> '$.link' AS TEXT) IS NULL THEN NULL "
+            "ELSE CAST(_jt.value -> '$.link' AS TEXT) END AS link "
+            "FROM JSON_EACH(source.links, '$.org') AS _jt) AS links",
+            read={
+                "mysql": "SELECT * FROM source, JSON_TABLE(source.links, '$.org[*]' COLUMNS(row_id FOR ORDINALITY, link VARCHAR(255) PATH '$.link' NULL ON EMPTY)) AS links",
+            },
+        )
+        self.validate_all(
+            "SELECT jt.row_id, jt.name, jt.price, jt.tag FROM t, LATERAL (SELECT "
+            "CAST(_jt.key AS BIGINT) + 1 AS row_id, "
+            "CASE WHEN JSON_TYPE(_jt.value, '$.name') IS NULL THEN CAST('n/a' AS TEXT) "
+            "WHEN JSON_TYPE(_jt.value, '$.name') = 'NULL' THEN NULL "
+            "WHEN JSON_TYPE(_jt.value, '$.name') IN ('OBJECT', 'ARRAY') THEN NULL "
+            "WHEN TRY_CAST(_jt.value -> '$.name' AS TEXT) IS NULL THEN NULL "
+            "ELSE CAST(_jt.value -> '$.name' AS TEXT) END AS name, "
+            "CASE WHEN JSON_TYPE(_jt.value, '$.price') IS NULL THEN NULL "
+            "WHEN JSON_TYPE(_jt.value, '$.price') = 'NULL' THEN NULL "
+            "WHEN JSON_TYPE(_jt.value, '$.price') IN ('OBJECT', 'ARRAY') THEN CAST('0' AS DECIMAL(10, 2)) "
+            "WHEN TRY_CAST(_jt.value -> '$.price' AS DECIMAL(10, 2)) IS NULL THEN CAST('0' AS DECIMAL(10, 2)) "
+            "ELSE CAST(_jt.value -> '$.price' AS DECIMAL(10, 2)) END AS price, "
+            "CASE WHEN _jt_3.key IS NULL THEN NULL ELSE "
+            "CASE WHEN JSON_TYPE(_jt_3.value, '$') IS NULL THEN NULL "
+            "WHEN JSON_TYPE(_jt_3.value, '$') = 'NULL' THEN NULL "
+            "WHEN JSON_TYPE(_jt_3.value, '$') IN ('OBJECT', 'ARRAY') THEN NULL "
+            "WHEN TRY_CAST(_jt_3.value -> '$' AS TEXT) IS NULL THEN NULL "
+            "ELSE CAST(_jt_3.value -> '$' AS TEXT) END END AS tag "
+            "FROM JSON_EACH(t.doc, '$.items') AS _jt "
+            "LEFT JOIN LATERAL (SELECT * FROM JSON_EACH(_jt.value, '$.tags')) AS _jt_3 ON TRUE) AS jt "
+            "WHERE jt.price > 0",
+            read={
+                "mysql": "SELECT jt.row_id, jt.name, jt.price, jt.tag FROM t, "
+                "JSON_TABLE(t.doc, '$.items[*]' COLUMNS("
+                "row_id FOR ORDINALITY, "
+                "name VARCHAR(100) PATH '$.name' DEFAULT 'n/a' ON EMPTY, "
+                "price DECIMAL(10,2) PATH '$.price' DEFAULT '0' ON ERROR, "
+                "NESTED PATH '$.tags[*]' COLUMNS(tag VARCHAR(50) PATH '$'))) AS jt "
+                "WHERE jt.price > 0",
+            },
+        )
+
+        # The source AST must not be mutated by the DuckDB transpilation
+        ast = parse_one(
+            "SELECT * FROM t, JSON_TABLE(t.doc, '$.items[*]' COLUMNS(x INT PATH '$.x')) AS jt",
+            read="mysql",
+        )
+        ast.sql("duckdb")
+        self.assertEqual(
+            ast.sql("mysql"),
+            "SELECT * FROM t, JSON_TABLE(t.doc, '$.items[*]' COLUMNS(x INT PATH '$.x')) AS jt",
+        )
+
+        for sql in (
+            # ERROR ON ... cannot be faithfully expressed in DuckDB
+            "SELECT * FROM t, JSON_TABLE(t.doc, '$[*]' COLUMNS(x INT PATH '$.x' ERROR ON ERROR)) AS jt",
+            "SELECT * FROM t, JSON_TABLE(t.doc, '$[*]' COLUMNS(x INT PATH '$.x' ERROR ON EMPTY)) AS jt",
+            # Only one level of NESTED PATH is supported
+            "SELECT * FROM t, JSON_TABLE(t.doc, '$.a[*]' COLUMNS(NESTED PATH '$.b[*]' COLUMNS(NESTED PATH '$.c[*]' COLUMNS(x INT PATH '$')))) AS jt",
+            # Only array-exploding row paths are supported
+            "SELECT * FROM t, JSON_TABLE(t.doc, '$.a' COLUMNS(x INT PATH '$.x')) AS jt",
+            # Only literal DEFAULT values are supported
+            "SELECT * FROM t, JSON_TABLE(t.doc, '$[*]' COLUMNS(x INT PATH '$.x' DEFAULT (1 + 2) ON EMPTY)) AS jt",
+        ):
+            with self.assertRaises(UnsupportedError):
+                parse_one(sql, read="mysql").sql("duckdb", unsupported_level=ErrorLevel.RAISE)

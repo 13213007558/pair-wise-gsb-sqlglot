@@ -3936,7 +3936,15 @@ class Generator:
         format_json = " FORMAT JSON" if expression.args.get("format_json") else ""
 
         ordinality = " FOR ORDINALITY" if expression.args.get("ordinality") else ""
-        return f"{this}{kind}{format_json}{path}{ordinality}"
+        on_handling = ""
+        for arg, clause in (("on_empty", "EMPTY"), ("on_error", "ERROR")):
+            handling = expression.args.get(arg)
+            if isinstance(handling, exp.Expr):
+                on_handling += f" DEFAULT {self.sql(handling)} ON {clause}"
+            elif handling:
+                on_handling += f" {handling}"
+
+        return f"{this}{kind}{format_json}{path}{ordinality}{on_handling}"
 
     def jsonschema_sql(self, expression: exp.JSONSchema) -> str:
         return self.func("COLUMNS", *expression.expressions)
