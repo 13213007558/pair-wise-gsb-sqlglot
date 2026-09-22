@@ -216,6 +216,13 @@ def _is_nanosecond_unit(unit: exp.Expr | None) -> bool:
     return isinstance(unit, (exp.Var, exp.Literal)) and unit.name.upper() == "NANOSECOND"
 
 
+def _jsontable_array_path(path: str | None) -> str:
+    # MySQL array paths end in [*]; DuckDB's json_each takes the path of the array itself
+    if not path:
+        return "$"
+    return path[:-3] if path.endswith("[*]") else path
+
+
 def _handle_nanosecond_diff(
     self: DuckDBGenerator,
     end_time: exp.Expr,
@@ -4722,6 +4729,114 @@ class DuckDBGenerator(generator.Generator):
             expression = json_value
 
         return _arrow_json_extract_sql(self, expression)
+
+    def jsontable_sql(self, expression: exp.JSONTable) -> str:
+        # Rewrites MySQL's JSON_TABLE as a lateral subquery over DuckDB's json_each.
+        # Supported scope: scalar PATH columns, FOR ORDINALITY and one NESTED PATH level.
+        this = self.sql(expression, "this")
+
+        path = expression.args.get("path")
+        path_sql = self.sql(exp.Literal.string(_jsontable_array_path(path and path.name)))
+
+        empty_handling = expression.args.get("empty_handling")
+        error_handling = expression.args.get("error_handling")
+
+        selects = []
+        nested_join = ""
+
+        for column in expression.args["schema"].expressions:
+            nested_schema = column.args.get("nested_schema")
+            if not nested_schema:
+                selects.append(
+                    self._jsontable_column_sql(column, "_jt", empty_handling, error_handling)
+                )
+                continue
+
+            if nested_join:
+                self.unsupported("JSON_TABLE with multiple NESTED PATH clauses")
+                continue
+
+            nested_path = column.args.get("path")
+            nested_path_sql = self.sql(
+                exp.Literal.string(_jsontable_array_path(nested_path and nested_path.name))
+            )
+            nested_join = (
+                f" LEFT JOIN LATERAL (SELECT * FROM json_each(_jt.value, {nested_path_sql}))"
+                " AS _jtn ON TRUE"
+            )
+
+            for nested_column in nested_schema.expressions:
+                if nested_column.args.get("nested_schema"):
+                    self.unsupported("JSON_TABLE with more than one NESTED PATH level")
+                    continue
+                selects.append(
+                    self._jsontable_column_sql(
+                        nested_column, "_jtn", empty_handling, error_handling, nested=True
+                    )
+                )
+
+        return (
+            f"LATERAL (SELECT {', '.join(selects)} "
+            f"FROM json_each({this}, {path_sql}) AS _jt{nested_join})"
+        )
+
+    def _jsontable_column_sql(
+        self,
+        column: exp.JSONColumnDef,
+        source: str,
+        empty_handling: str | exp.Expr | None,
+        error_handling: str | exp.Expr | None,
+        nested: bool = False,
+    ) -> str:
+        alias = self.sql(column, "this")
+
+        if column.args.get("ordinality"):
+            # json_each's key is the 0-based array index, ordinality is 1-based
+            return f"CAST({source}.key AS BIGINT) + 1 AS {alias}"
+
+        if column.args.get("format_json"):
+            self.unsupported("JSON_TABLE FORMAT JSON columns")
+
+        kind = self.sql(column, "kind") or "VARCHAR"
+        path = self.sql(column, "path")
+        json_type = f"json_type({source}.value, {path})"
+        json_value = f"json_value({source}.value, {path})"
+
+        empty = self._jsontable_handling_sql(empty_handling, "EMPTY", kind)
+
+        if isinstance(error_handling, str) and error_handling.startswith("ERROR"):
+            # A strict CAST raises on conversion failure, matching ERROR ON ERROR
+            value = f"CAST({json_value} AS {kind})"
+        else:
+            value = f"TRY_CAST({json_value} AS {kind})"
+            if isinstance(error_handling, exp.Expression):
+                default = self._jsontable_default_sql(error_handling, kind)
+                value = f"COALESCE({value}, {default})"
+
+        sql = (
+            f"CASE WHEN {json_type} IS NULL THEN {empty} "
+            f"WHEN {json_type} = 'NULL' THEN NULL ELSE {value} END"
+        )
+        if nested:
+            # A non-matching NESTED PATH left-joins, so its columns are plain NULL
+            sql = f"CASE WHEN {source}.value IS NULL THEN NULL ELSE {sql} END"
+
+        return f"{sql} AS {alias}"
+
+    def _jsontable_handling_sql(
+        self, handling: str | exp.Expr | None, condition: str, kind: str
+    ) -> str:
+        if isinstance(handling, exp.Expression):
+            return self._jsontable_default_sql(handling, kind)
+        if isinstance(handling, str) and handling.startswith("ERROR"):
+            self.unsupported(f"JSON_TABLE ERROR ON {condition}")
+        return "NULL"
+
+    def _jsontable_default_sql(self, default: exp.Expr, kind: str) -> str:
+        if not isinstance(default, exp.Literal):
+            self.unsupported("JSON_TABLE DEFAULT clause with a non-literal value")
+            return "NULL"
+        return f"CAST({self.sql(default)} AS {kind})"
 
     def bitwisenot_sql(self, expression: exp.BitwiseNot) -> str:
         this = expression.this

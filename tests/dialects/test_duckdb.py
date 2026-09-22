@@ -1693,6 +1693,51 @@ class TestDuckDB(Validator):
             },
         )
 
+    def test_json_table(self):
+        self.validate_all(
+            "SELECT jt.* FROM source, LATERAL (SELECT CAST(_jt.key AS BIGINT) + 1 AS row_id, CASE WHEN json_type(_jt.value, '$.link') IS NULL THEN NULL WHEN json_type(_jt.value, '$.link') = 'NULL' THEN NULL ELSE TRY_CAST(json_value(_jt.value, '$.link') AS TEXT(255)) END AS link FROM json_each(source.links, '$.org') AS _jt) AS jt WHERE jt.row_id > 1",
+            read={
+                "mysql": "SELECT jt.* FROM source, JSON_TABLE(source.links, '$.org[*]' COLUMNS(row_id FOR ORDINALITY, link VARCHAR(255) PATH '$.link')) AS jt WHERE jt.row_id > 1",
+            },
+        )
+        self.validate_all(
+            "SELECT * FROM t, LATERAL (SELECT CAST(_jt.key AS BIGINT) + 1 AS id, CASE WHEN json_type(_jt.value, '$.v') IS NULL THEN NULL WHEN json_type(_jt.value, '$.v') = 'NULL' THEN NULL ELSE TRY_CAST(json_value(_jt.value, '$.v') AS INT) END AS v, CAST(_jtn.key AS BIGINT) + 1 AS nid, CASE WHEN _jtn.value IS NULL THEN NULL ELSE CASE WHEN json_type(_jtn.value, '$.n') IS NULL THEN NULL WHEN json_type(_jtn.value, '$.n') = 'NULL' THEN NULL ELSE TRY_CAST(json_value(_jtn.value, '$.n') AS DOUBLE) END END AS nval FROM json_each(t.j, '$') AS _jt LEFT JOIN LATERAL (SELECT * FROM json_each(_jt.value, '$.items')) AS _jtn ON TRUE) AS jt",
+            read={
+                "mysql": "SELECT * FROM t, JSON_TABLE(t.j, '$[*]' COLUMNS(id FOR ORDINALITY, v INT PATH '$.v', NESTED PATH '$.items[*]' COLUMNS(nid FOR ORDINALITY, nval DOUBLE PATH '$.n'))) AS jt",
+            },
+        )
+        self.validate_all(
+            "SELECT * FROM t, LATERAL (SELECT CASE WHEN json_type(_jt.value, '$.v') IS NULL THEN CAST('n/a' AS TEXT) WHEN json_type(_jt.value, '$.v') = 'NULL' THEN NULL ELSE COALESCE(TRY_CAST(json_value(_jt.value, '$.v') AS TEXT), CAST('n/a' AS TEXT)) END AS v FROM json_each(t.j, '$') AS _jt) AS jt",
+            read={
+                "mysql": "SELECT * FROM t, JSON_TABLE(t.j, '$[*]' DEFAULT 'n/a' ON ERROR DEFAULT 'n/a' ON EMPTY COLUMNS(v VARCHAR PATH '$.v')) AS jt",
+            },
+        )
+        self.validate_all(
+            "SELECT * FROM t, LATERAL (SELECT CASE WHEN json_type(_jt.value, '$.v') IS NULL THEN NULL WHEN json_type(_jt.value, '$.v') = 'NULL' THEN NULL ELSE CAST(json_value(_jt.value, '$.v') AS INT) END AS v FROM json_each(t.j, '$') AS _jt) AS jt",
+            read={
+                "mysql": "SELECT * FROM t, JSON_TABLE(t.j, '$[*]' ERROR ON ERROR COLUMNS(v INT PATH '$.v')) AS jt",
+            },
+        )
+        self.validate_all(
+            "SELECT * FROM t, JSON_TABLE(t.j, '$[*]' ERROR ON EMPTY COLUMNS(v INT PATH '$.v')) AS jt",
+            write={
+                "duckdb": UnsupportedError,
+            },
+        )
+
+        # Transpiling to DuckDB must not mutate the AST, it can still target other dialects
+        ast = parse_one(
+            "SELECT * FROM t, JSON_TABLE(t.j, '$[*]' ERROR ON ERROR DEFAULT 'n/a' ON EMPTY COLUMNS(v INT PATH '$.v')) AS jt",
+            read="mysql",
+        )
+        mysql_sql = ast.sql("mysql")
+        self.assertEqual(
+            mysql_sql,
+            "SELECT * FROM t, JSON_TABLE(t.j, '$[*]' ERROR ON ERROR DEFAULT 'n/a' ON EMPTY COLUMNS(v INT PATH '$.v')) AS jt",
+        )
+        ast.sql("duckdb")
+        self.assertEqual(ast.sql("mysql"), mysql_sql)
+
     def test_array_index(self):
         with self.assertLogs(helper_logger) as cm:
             self.validate_all(

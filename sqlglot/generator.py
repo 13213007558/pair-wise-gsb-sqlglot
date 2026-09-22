@@ -3946,9 +3946,19 @@ class Generator:
         path = self.sql(expression, "path")
         path = f", {path}" if path else ""
         error_handling = expression.args.get("error_handling")
-        error_handling = f" {error_handling}" if error_handling else ""
+        if isinstance(error_handling, exp.Expression):
+            error_handling = f" DEFAULT {self.sql(error_handling)} ON ERROR"
+        elif error_handling:
+            error_handling = f" {error_handling}"
+        else:
+            error_handling = ""
         empty_handling = expression.args.get("empty_handling")
-        empty_handling = f" {empty_handling}" if empty_handling else ""
+        if isinstance(empty_handling, exp.Expression):
+            empty_handling = f" DEFAULT {self.sql(empty_handling)} ON EMPTY"
+        elif empty_handling:
+            empty_handling = f" {empty_handling}"
+        else:
+            empty_handling = ""
         schema = self.sql(expression, "schema")
         return self.func(
             "JSON_TABLE", this, suffix=f"{path}{error_handling}{empty_handling} {schema})"
