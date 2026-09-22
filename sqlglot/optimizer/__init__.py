@@ -24,6 +24,7 @@ _import_lock = threading.RLock()
 # Only for type checkers and IDEs; runtime resolution goes through __getattr__.
 if t.TYPE_CHECKING:
     from sqlglot.optimizer.optimizer import RULES as RULES, optimize as optimize
+    from sqlglot.optimizer.row_policy import apply_row_policies as apply_row_policies
     from sqlglot.optimizer.scope import (
         Scope as Scope,
         build_scope as build_scope,
@@ -38,6 +39,7 @@ if t.TYPE_CHECKING:
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "RULES": ("sqlglot.optimizer.optimizer", "RULES"),
     "optimize": ("sqlglot.optimizer.optimizer", "optimize"),
+    "apply_row_policies": ("sqlglot.optimizer.row_policy", "apply_row_policies"),
     "Scope": ("sqlglot.optimizer.scope", "Scope"),
     "build_scope": ("sqlglot.optimizer.scope", "build_scope"),
     "find_all_in_scope": ("sqlglot.optimizer.scope", "find_all_in_scope"),
