@@ -14,6 +14,10 @@ import logging
 import typing as t
 
 from sqlglot import expressions as exp
+from sqlglot.archive import (
+    ArchiveFilterError as ArchiveFilterError,
+    apply_archive_filters as apply_archive_filters,
+)
 from sqlglot.dialects.dialect import Dialect as Dialect, Dialects as Dialects
 from sqlglot.diff import diff as diff
 from sqlglot.errors import (
