@@ -10,7 +10,11 @@ if t.TYPE_CHECKING:
     from sqlglot._typing import E
 
 
-def eliminate_joins(expression: E) -> E:
+def eliminate_joins(
+    expression: E,
+    constraints: dict[str, dict[str, t.Any]] | None = None,
+    trusted_tables: t.Collection[str] | None = None,
+) -> E:
     """
     Remove unused joins from an expression.
 
@@ -23,12 +27,37 @@ def eliminate_joins(expression: E) -> E:
         >>> eliminate_joins(expression).sql()
         'SELECT x.a FROM x'
 
+    Joins on base tables can also be removed when the caller supplies constraint
+    metadata and explicitly marks the involved tables as trusted, i.e. the
+    declared constraints are enforced by the database:
+
+        - A LEFT JOIN is removed when the joined table's equi-join key covers a
+          trusted primary or unique key, so each outer row matches at most one row.
+        - An INNER JOIN is additionally removed only when every outer row is
+          guaranteed to match: the outer key must be a trusted, non-nullable
+          foreign key referencing the joined table, and the ON clause must not
+          contain any additional predicates.
+
+    The metadata is only used for the duration of this call; it is never stored
+    on the expression or the schema, so it cannot leak into subsequent calls.
+
     Args:
         expression: expression to optimize
+        constraints: optional mapping of table name to constraint metadata, e.g.
+            {"y": {"primary_key": ["id"], "unique_keys": [["a", "b"]],
+                   "foreign_keys": [{"columns": ["x_id"], "ref_table": "x",
+                                     "ref_columns": ["id"]}],
+                   "not_null": ["id", "x_id"]}}
+            Names should match the normalized identifiers produced by qualify.
+        trusted_tables: tables whose declared constraints are enforced by the
+            database. Constraints declared for any other table are ignored.
 
     Returns:
         The optimized expression
     """
+    constraints = constraints or {}
+    trusted_tables = set(trusted_tables or ())
+
     for scope in traverse_scope(expression):
         joins: list[exp.Join] = scope.expression.args.get("joins", [])
         if not joins:
@@ -46,23 +75,120 @@ def eliminate_joins(expression: E) -> E:
                 continue
 
             alias = join.alias_or_name
-            if _should_eliminate_join(scope, join, alias):
+            if _should_eliminate_join(scope, join, alias, constraints, trusted_tables):
                 join.pop()
                 scope.remove_source(alias)
 
     return expression
 
 
-def _should_eliminate_join(scope: Scope, join: exp.Join, alias: str) -> bool:
+def _should_eliminate_join(
+    scope: Scope,
+    join: exp.Join,
+    alias: str,
+    constraints: dict[str, dict[str, t.Any]],
+    trusted_tables: set[str],
+) -> bool:
     inner_source = scope.sources.get(alias)
-    return (
-        isinstance(inner_source, Scope)
-        and not _join_is_used(scope, join, alias)
-        and (
-            (join.side == "LEFT" and _is_joined_on_all_unique_outputs(inner_source, join))
-            or (not join.args.get("on") and _has_single_output_row(inner_source))
+    if _join_is_used(scope, join, alias):
+        return False
+
+    if isinstance(inner_source, Scope):
+        return (join.side == "LEFT" and _is_joined_on_all_unique_outputs(inner_source, join)) or (
+            not join.args.get("on") and _has_single_output_row(inner_source)
         )
-    )
+
+    if isinstance(inner_source, exp.Table):
+        return _should_eliminate_table_join(scope, join, inner_source, constraints, trusted_tables)
+
+    return False
+
+
+def _should_eliminate_table_join(
+    scope: Scope,
+    join: exp.Join,
+    table: exp.Table,
+    constraints: dict[str, dict[str, t.Any]],
+    trusted_tables: set[str],
+) -> bool:
+    if table.name not in trusted_tables:
+        return False
+
+    table_constraints = constraints.get(table.name) or {}
+    unique_keys = [
+        table_constraints.get("primary_key") or (),
+        *(table_constraints.get("unique_keys") or ()),
+    ]
+    unique_keys = [frozenset(key) for key in unique_keys if key]
+    if not unique_keys:
+        return False
+
+    source_keys, join_keys, remaining = join_condition(join)
+
+    # Map each joined column to the source column it's equated to
+    joined_columns = {
+        join_key.name: source_key
+        for source_key, join_key in zip(source_keys, join_keys)
+        if isinstance(source_key, exp.Column) and isinstance(join_key, exp.Column)
+    }
+
+    # The equi-join key must cover a trusted unique key, so each outer row
+    # matches at most one joined row
+    if not any(key <= joined_columns.keys() for key in unique_keys):
+        return False
+
+    if join.side == "LEFT":
+        return True
+
+    # INNER JOINs are only removed when every outer row is guaranteed to match,
+    # so the ON clause must not carry any additional predicates
+    if join.side or join.kind not in ("", "INNER") or not _is_true(remaining):
+        return False
+
+    return _every_outer_row_matches(scope, table, constraints, trusted_tables, joined_columns)
+
+
+def _every_outer_row_matches(
+    scope: Scope,
+    table: exp.Table,
+    constraints: dict[str, dict[str, t.Any]],
+    trusted_tables: set[str],
+    joined_columns: dict[str, exp.Column],
+) -> bool:
+    pairs = {(source.table, source.name): joined for joined, source in joined_columns.items()}
+
+    for alias, source in scope.sources.items():
+        if not isinstance(source, exp.Table) or source.name not in trusted_tables:
+            continue
+
+        source_constraints = constraints.get(source.name) or {}
+        not_null = set(source_constraints.get("not_null") or ())
+
+        for foreign_key in source_constraints.get("foreign_keys") or ():
+            fk_columns = foreign_key.get("columns") or ()
+            ref_columns = foreign_key.get("ref_columns") or ()
+
+            # A trusted foreign key with non-nullable columns guarantees that
+            # every outer row matches a row in the referenced table
+            if (
+                foreign_key.get("ref_table") == table.name
+                and fk_columns
+                and len(fk_columns) == len(ref_columns)
+                and not_null >= set(fk_columns)
+                and all(
+                    pairs.get((alias, fk_column)) == ref_column
+                    for fk_column, ref_column in zip(fk_columns, ref_columns)
+                )
+            ):
+                return True
+
+    return False
+
+
+def _is_true(expression: exp.Expr) -> bool:
+    if isinstance(expression, exp.And):
+        return all(_is_true(operand) for operand in expression.flatten())
+    return isinstance(expression, exp.Boolean) and expression.this
 
 
 def _join_is_used(scope: Scope, join: exp.Join, alias: str) -> bool:

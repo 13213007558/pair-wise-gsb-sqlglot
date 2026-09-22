@@ -63,6 +63,8 @@ def optimize(
     dialect: DialectType = None,
     rules: Sequence[OptimizerFn] = RULES,
     sql: str | None = None,
+    constraints: dict[str, dict[str, t.Any]] | None = None,
+    trusted_tables: t.Collection[str] | None = None,
     **kwargs: object,
 ) -> exp.Expr:
     """
@@ -85,6 +87,12 @@ def optimize(
             Do not remove `qualify` from the sequence of rules unless you know what you're doing!
         sql: Original SQL string for error highlighting. If not provided, errors will not include
             highlighting. Requires that the expression has position metadata from parsing.
+        constraints: optional mapping of table name to constraint metadata (primary keys,
+            unique keys, foreign keys, not-null columns), used by rules such as
+            `eliminate_joins`. See that rule's docstring for the expected shape.
+        trusted_tables: tables whose declared constraints are enforced by the database
+            and can therefore be relied upon during optimization. The metadata is only
+            used for the duration of this call and never persists across calls.
         **kwargs: If a rule has a keyword argument with a same name in **kwargs, it will be passed in.
 
     Returns:
@@ -99,6 +107,8 @@ def optimize(
         "sql": sql,
         "isolate_tables": True,  # needed for other optimizations to perform well
         "quote_identifiers": False,
+        "constraints": constraints,
+        "trusted_tables": trusted_tables,
         **kwargs,
     }
 

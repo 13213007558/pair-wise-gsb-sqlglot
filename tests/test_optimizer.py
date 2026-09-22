@@ -1,4 +1,5 @@
 import unittest
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
 from unittest.mock import patch
@@ -1521,6 +1522,133 @@ SELECT :with_,WITH :expressions,CTE :this,UNION :this,SELECT :expressions,1,:exp
             optimizer.eliminate_joins.eliminate_joins,
             pretty=True,
         )
+
+    def test_eliminate_joins_with_constraints(self):
+        self.conn.execute(
+            """
+            CREATE OR REPLACE TABLE dim (id INT, k1 INT, k2 INT, val TEXT);
+            CREATE OR REPLACE TABLE fact_clean (dim_id INT, k1 INT, k2 INT, amt INT);
+            CREATE OR REPLACE TABLE fact_dirty (dim_id INT, amt INT);
+
+            INSERT INTO dim VALUES (1, 10, 100, 'a'), (2, 10, 200, 'b'), (3, 30, 300, 'c');
+            INSERT INTO fact_clean VALUES (1, 10, 100, 6), (2, 10, 200, 6), (2, 10, 200, 7);
+            INSERT INTO fact_dirty VALUES (1, 5), (NULL, 6), (99, 7);
+            """
+        )
+
+        schema = {
+            "dim": {"id": "INT", "k1": "INT", "k2": "INT", "val": "TEXT"},
+            "fact_clean": {"dim_id": "INT", "k1": "INT", "k2": "INT", "amt": "INT"},
+            "fact_dirty": {"dim_id": "INT", "amt": "INT"},
+        }
+        constraints = {
+            "dim": {"primary_key": ["id"], "unique_keys": [["k1", "k2"]]},
+            "fact_clean": {
+                "foreign_keys": [
+                    {"columns": ["dim_id"], "ref_table": "dim", "ref_columns": ["id"]},
+                    {"columns": ["k1", "k2"], "ref_table": "dim", "ref_columns": ["k1", "k2"]},
+                ],
+                "not_null": ["dim_id", "k1", "k2"],
+            },
+        }
+
+        def optimize_with_constraints(sql, **overrides):
+            kwargs = {
+                "constraints": constraints,
+                "trusted_tables": ["dim", "fact_clean"],
+                **overrides,
+            }
+            return optimizer.optimize(sql, schema=schema, **kwargs)
+
+        def assert_unchanged_results(sql, optimized):
+            # Counters compare rows together with their duplicate counts
+            expected = Counter(self.conn.execute(sql).fetchall())
+            actual = Counter(self.conn.execute(optimized.sql(dialect="duckdb")).fetchall())
+            self.assertEqual(expected, actual)
+
+        # LEFT JOIN: a trusted unique key on the joined table means each outer
+        # row matches at most one row, so the unused join can be dropped
+        sql = "SELECT f.amt FROM fact_clean AS f LEFT JOIN dim AS d ON f.dim_id = d.id"
+        optimized = optimize_with_constraints(sql)
+        self.assertNotIn("JOIN", optimized.sql())
+        assert_unchanged_results(sql, optimized)
+
+        # INNER JOIN: a trusted, non-nullable foreign key additionally guarantees
+        # that every outer row matches exactly one row
+        sql = "SELECT f.amt FROM fact_clean AS f JOIN dim AS d ON f.dim_id = d.id"
+        optimized = optimize_with_constraints(sql)
+        self.assertNotIn("JOIN", optimized.sql())
+        assert_unchanged_results(sql, optimized)
+
+        # Composite unique key / composite foreign key
+        for join in ("LEFT JOIN", "JOIN"):
+            sql = (
+                f"SELECT f.amt FROM fact_clean AS f {join} dim AS d"
+                " ON f.k1 = d.k1 AND f.k2 = d.k2"
+            )
+            optimized = optimize_with_constraints(sql)
+            self.assertNotIn("JOIN", optimized.sql())
+            assert_unchanged_results(sql, optimized)
+
+        # The join key doesn't cover the whole composite unique key: dim.k1 alone
+        # isn't unique, so eliminating the join would drop duplicate matches
+        sql = "SELECT f.amt FROM fact_clean AS f LEFT JOIN dim AS d ON f.k1 = d.k1"
+        optimized = optimize_with_constraints(sql)
+        self.assertIn("JOIN", optimized.sql())
+        assert_unchanged_results(sql, optimized)
+        self.assertEqual(len(self.conn.execute(sql).fetchall()), 6)
+
+        # A unique key on the right isn't enough for an INNER JOIN: without a
+        # trusted foreign key, outer rows aren't guaranteed to match
+        sql = "SELECT f.amt FROM fact_clean AS f JOIN dim AS d ON f.dim_id = d.id"
+        optimized = optimize_with_constraints(sql, trusted_tables=["dim"])
+        self.assertIn("JOIN", optimized.sql())
+        assert_unchanged_results(sql, optimized)
+
+        # A LEFT JOIN only needs the joined table's trusted key
+        sql = "SELECT f.amt FROM fact_clean AS f LEFT JOIN dim AS d ON f.dim_id = d.id"
+        optimized = optimize_with_constraints(sql, trusted_tables=["dim"])
+        self.assertNotIn("JOIN", optimized.sql())
+        assert_unchanged_results(sql, optimized)
+
+        # A nullable foreign key can't guarantee a match for every outer row:
+        # fact_dirty contains NULLs and a missing reference (99)
+        sql = "SELECT f.amt FROM fact_dirty AS f JOIN dim AS d ON f.dim_id = d.id"
+        optimized = optimize_with_constraints(
+            sql,
+            constraints={
+                "dim": {"primary_key": ["id"]},
+                "fact_dirty": {
+                    "foreign_keys": [
+                        {"columns": ["dim_id"], "ref_table": "dim", "ref_columns": ["id"]}
+                    ]
+                },
+            },
+            trusted_tables=["dim", "fact_dirty"],
+        )
+        self.assertIn("JOIN", optimized.sql())
+        assert_unchanged_results(sql, optimized)
+
+        # An extra ON predicate can filter out the single matching row
+        sql = "SELECT f.amt FROM fact_clean AS f JOIN dim AS d ON f.dim_id = d.id AND d.val = 'a'"
+        optimized = optimize_with_constraints(sql)
+        self.assertIn("JOIN", optimized.sql())
+        assert_unchanged_results(sql, optimized)
+
+        # The joined table is referenced outside the ON clause
+        sql = "SELECT f.amt, d.val FROM fact_clean AS f LEFT JOIN dim AS d ON f.dim_id = d.id"
+        optimized = optimize_with_constraints(sql)
+        self.assertIn("JOIN", optimized.sql())
+        assert_unchanged_results(sql, optimized)
+
+        # Constraints are ignored for tables the caller didn't mark as trusted
+        sql = "SELECT f.amt FROM fact_clean AS f LEFT JOIN dim AS d ON f.dim_id = d.id"
+        optimized = optimize_with_constraints(sql, trusted_tables=[])
+        self.assertIn("JOIN", optimized.sql())
+
+        # The metadata doesn't leak into subsequent optimize calls
+        self.assertNotIn("JOIN", optimize_with_constraints(sql).sql())
+        self.assertIn("JOIN", optimizer.optimize(sql, schema=schema).sql())
 
     def test_eliminate_ctes(self):
         self.check_file(
