@@ -50,6 +50,11 @@ from sqlglot.expressions import (
     union as union,
 )
 from sqlglot.generator import Generator as Generator
+from sqlglot.parameterize import (
+    ParameterizedQuery as ParameterizedQuery,
+    SkippedLiteral as SkippedLiteral,
+    parameterize as parameterize,
+)
 from sqlglot.parser import Parser as Parser
 from sqlglot.schema import MappingSchema as MappingSchema, Schema as Schema
 from sqlglot.tokens import Token as Token, Tokenizer as Tokenizer, TokenType as TokenType
