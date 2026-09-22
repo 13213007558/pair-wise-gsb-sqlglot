@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import typing as t
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 from sqlglot import Schema, exp, maybe_parse
 from sqlglot.errors import SqlglotError
@@ -191,6 +191,601 @@ def lineage(
         )
 
     return result
+
+
+class DependencyKind:
+    """Impact categories recorded in a DependencyReport."""
+
+    # The column feeds a computed output value (projections, CASE conditions,
+    # window definitions, aggregate inputs).
+    VALUE = "value"
+    # The column determines which rows appear (JOIN/WHERE/HAVING/QUALIFY,
+    # GROUP BY, DISTINCT, ORDER BY ... LIMIT).
+    ROWS = "rows"
+    # The column only determines output ordering (ORDER BY without LIMIT).
+    ORDER = "order"
+
+
+@dataclass(frozen=True)
+class Dependency:
+    """A classified dependency on a physical table column or relation.
+
+    Attributes:
+        kind: One of DependencyKind.VALUE / ROWS / ORDER.
+        table: The physical table the dependency bottoms out at.
+        column: The column name, or "*" when the dependency is on the
+            relation's rows (e.g. COUNT(*)).
+        reason: The syntactic construct that introduced the dependency,
+            e.g. "projection", "where", "join", "group_by", "having",
+            "distinct", "window_partition", "window_order", "case_condition",
+            "order_by" or "order_by_limit".
+        scope: Stable identifier of the query level owning the construct
+            ("q0", "q1", ...), see DependencyReport.scopes.
+        select: The output column whose value this feeds (value dependencies).
+    """
+
+    kind: str
+    table: str
+    column: str
+    reason: str
+    scope: str
+    select: str = ""
+
+
+@dataclass(frozen=True)
+class Unknown:
+    """A dependency that could not be determined, with the reason why."""
+
+    reason: str
+    detail: str
+    scope: str
+
+
+@dataclass
+class DependencyReport:
+    """Classified dependencies of a query, resolved to physical table columns.
+
+    Unlike the lineage() graph, which only follows output values, a report
+    also records which columns determine the row set and the output ordering,
+    so impact analysis can tell "changing this column changes values, the row
+    set, or the order" apart.
+    """
+
+    dependencies: list[Dependency]
+    unknowns: list[Unknown]
+    # Stable scope id -> the SQL of that query level
+    scopes: dict[str, str]
+
+    @property
+    def value(self) -> list[Dependency]:
+        return [d for d in self.dependencies if d.kind == DependencyKind.VALUE]
+
+    @property
+    def rows(self) -> list[Dependency]:
+        return [d for d in self.dependencies if d.kind == DependencyKind.ROWS]
+
+    @property
+    def order(self) -> list[Dependency]:
+        return [d for d in self.dependencies if d.kind == DependencyKind.ORDER]
+
+    def by_column(self) -> dict[str, list[str]]:
+        """Map each physical "table.column" to the impact categories it has."""
+        impact: dict[str, set[str]] = {}
+        for d in self.dependencies:
+            impact.setdefault(f"{d.table}.{d.column}", set()).add(d.kind)
+        return {column: sorted(kinds) for column, kinds in sorted(impact.items())}
+
+    def to_dict(self) -> dict[str, t.Any]:
+        return {
+            "dependencies": [asdict(d) for d in self.dependencies],
+            "unknowns": [asdict(u) for u in self.unknowns],
+            "scopes": dict(self.scopes),
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict())
+
+
+def dependency_report(
+    sql: str | exp.Expr,
+    schema: dict | Schema | None = None,
+    sources: Mapping[str, str | exp.Query] | None = None,
+    dialect: DialectType = None,
+    copy: bool = True,
+    **kwargs,
+) -> DependencyReport:
+    """Build a classified dependency report for a SQL query.
+
+    This is an explicit alternative to lineage(): every dependency is traced
+    through CTEs, subqueries and set operations down to physical table columns
+    (stars are expanded when a schema is available) and classified by impact
+    kind - "value", "rows" or "order" - together with the query level that
+    introduced it. Anything that cannot be determined (e.g. unexpanded stars,
+    recursive constructs, UDTFs) is reported as an Unknown with a reason
+    instead of being silently dropped.
+
+    Args:
+        sql: The SQL string or expression.
+        schema: The schema of tables, used to expand stars and resolve
+            unqualified columns.
+        sources: A mapping of queries which will be used to continue resolving.
+        dialect: The dialect of input SQL.
+        copy: Whether to copy the Expr arguments.
+        **kwargs: Qualification optimizer kwargs.
+
+    Returns:
+        A DependencyReport with stable, serializable node identities.
+
+    Example:
+        >>> report = dependency_report(
+        ...     "SELECT salary FROM staff WHERE region = 'east' ORDER BY salary LIMIT 3"
+        ... )
+        >>> report.by_column()
+        {'staff.region': ['rows'], 'staff.salary': ['rows', 'value']}
+    """
+    expression = maybe_parse(sql, copy=copy, dialect=dialect)
+
+    if sources:
+        expression = exp.expand(
+            expression,
+            {
+                k: t.cast(exp.Query, maybe_parse(v, copy=copy, dialect=dialect))
+                for k, v in sources.items()
+            },
+            dialect=dialect,
+            copy=copy,
+        )
+
+    schema = ensure_schema(schema, dialect=dialect)
+
+    expression = qualify.qualify(
+        expression,
+        dialect=dialect,
+        schema=schema,
+        **{"validate_qualify_columns": False, "identify": False, **kwargs},  # type: ignore
+    )
+    scope = build_scope(expression)
+
+    if not scope:
+        raise SqlglotError("Cannot build dependency report, sql must be SELECT")
+
+    return _DependencyCollector(scope, schema, dialect).run()
+
+
+class _DependencyCollector:
+    """Walks every scope of a qualified query, classifying column dependencies."""
+
+    def __init__(self, root: Scope, schema: Schema, dialect: DialectType) -> None:
+        self.schema = schema
+        self.dialect = dialect
+
+        # Stable, deterministic query-level identities; the root is always q0
+        self.ordered_scopes = [root] + [s for s in root.traverse() if s is not root]
+        self.scope_ids = {id(s): f"q{i}" for i, s in enumerate(self.ordered_scopes)}
+        self.scope_sql = {
+            self.scope_ids[id(s)]: s.expression.sql(dialect=dialect) for s in self.ordered_scopes
+        }
+
+        self.dependencies: set[Dependency] = set()
+        self.unknowns: set[Unknown] = set()
+
+        self._column_cache: dict[tuple, frozenset] = {}
+        self._select_cache: dict[tuple, frozenset] = {}
+        self._select_maps: dict[int, dict[str, exp.Expr]] = {}
+        self._resolving: set[tuple] = set()
+
+    def run(self) -> DependencyReport:
+        for scope in self.ordered_scopes:
+            expression = scope.expression
+            if isinstance(expression, exp.Select):
+                self._collect_select(scope)
+            elif isinstance(expression, exp.SetOperation):
+                # Branches are visited as their own scopes; only the set
+                # operation's own modifiers are collected here
+                self._collect_order(scope, expression)
+
+        return DependencyReport(
+            dependencies=sorted(
+                self.dependencies,
+                key=lambda d: (d.kind, d.table, d.column, d.select, d.reason, d.scope),
+            ),
+            unknowns=sorted(self.unknowns, key=lambda u: (u.reason, u.detail, u.scope)),
+            scopes=self.scope_sql,
+        )
+
+    # Clause collection
+
+    def _collect_select(self, scope: Scope) -> None:
+        select = t.cast(exp.Select, scope.expression)
+        sid = self.scope_ids[id(scope)]
+
+        for projection in select.selects:
+            self._collect_projection(scope, projection, sid)
+
+        for key in ("where", "having", "qualify"):
+            clause = select.args.get(key)
+            if clause:
+                self._collect_columns(scope, clause, DependencyKind.ROWS, key, sid)
+
+        for join in select.args.get("joins") or []:
+            on = join.args.get("on")
+            if on:
+                self._collect_columns(scope, on, DependencyKind.ROWS, "join", sid)
+            for using in join.args.get("using") or []:
+                self._add_column_deps(
+                    scope, exp.column(using.name), DependencyKind.ROWS, "join", sid
+                )
+
+        group = select.args.get("group")
+        if group:
+            self._collect_columns(scope, group, DependencyKind.ROWS, "group_by", sid)
+
+        if select.args.get("distinct"):
+            for projection in select.selects:
+                self._collect_columns(scope, projection, DependencyKind.ROWS, "distinct", sid)
+
+        self._collect_order(scope, select)
+
+    def _collect_order(self, scope: Scope, query: exp.Expr) -> None:
+        order = query.args.get("order")
+        if not order:
+            return
+
+        sid = self.scope_ids[id(scope)]
+        if query.args.get("limit") or query.args.get("fetch"):
+            # With a row cap, ordering decides which rows survive
+            self._collect_columns(scope, order, DependencyKind.ROWS, "order_by_limit", sid)
+        else:
+            self._collect_columns(scope, order, DependencyKind.ORDER, "order_by", sid)
+
+    def _collect_projection(self, scope: Scope, projection: exp.Expr, sid: str) -> None:
+        name = projection.alias_or_name or projection.sql(comments=False, dialect=self.dialect)
+
+        if isinstance(projection, exp.Star) or (
+            isinstance(projection, exp.Column) and projection.is_star
+        ):
+            table = projection.table if isinstance(projection, exp.Column) else None
+            for table_name, column in self._resolve_star(scope, table or None):
+                self.dependencies.add(
+                    Dependency(DependencyKind.VALUE, table_name, column, "projection", sid, name)
+                )
+            return
+
+        # Columns in CASE conditions and window definitions are value
+        # dependencies too, but with a more specific reason
+        skip: set[int] = set()
+        for window in find_all_in_scope(projection, exp.Window):
+            for partition in window.args.get("partition_by") or []:
+                self._collect_columns(
+                    scope, partition, DependencyKind.VALUE, "window_partition", sid, name
+                )
+                skip.update(id(c) for c in find_all_in_scope(partition, exp.Column))
+            order = window.args.get("order")
+            if order:
+                self._collect_columns(scope, order, DependencyKind.VALUE, "window_order", sid, name)
+                skip.update(id(c) for c in find_all_in_scope(order, exp.Column))
+
+        for case_if in find_all_in_scope(projection, exp.If):
+            self._collect_columns(
+                scope, case_if.this, DependencyKind.VALUE, "case_condition", sid, name
+            )
+            skip.update(id(c) for c in find_all_in_scope(case_if.this, exp.Column))
+
+        self._collect_columns(
+            scope, projection, DependencyKind.VALUE, "projection", sid, name, skip
+        )
+
+    def _collect_columns(
+        self,
+        scope: Scope,
+        expression: exp.Expr,
+        kind: str,
+        reason: str,
+        sid: str,
+        select_name: str = "",
+        skip: t.AbstractSet[int] = frozenset(),
+    ) -> None:
+        for column in find_all_in_scope(expression, exp.Column):
+            if id(column) not in skip:
+                self._add_column_deps(scope, column, kind, reason, sid, select_name)
+
+        # COUNT(*) / COUNT(1) have no column value source but still depend on
+        # the input rows of every relation in this scope
+        for count in find_all_in_scope(expression, exp.Count):
+            if not any(find_all_in_scope(count, exp.Column)):
+                self._collect_relation_rows(scope, kind, reason, sid, select_name)
+
+        subquery_scopes = {id(s.expression): s for s in scope.subquery_scopes}
+        for subquery in find_all_in_scope(expression, *exp.UNWRAPPED_QUERIES):
+            subquery_scope = subquery_scopes.get(id(subquery))
+            if subquery_scope is None:
+                self._unknown(
+                    "unknown_subquery", subquery.sql(comments=False, dialect=self.dialect), sid
+                )
+                continue
+            for name in subquery.named_selects:
+                for table, column in self._resolve_named_select(subquery_scope, name):
+                    self.dependencies.add(
+                        Dependency(
+                            kind,
+                            table,
+                            column,
+                            reason,
+                            self.scope_ids[id(subquery_scope)],
+                            select_name,
+                        )
+                    )
+
+    def _collect_relation_rows(
+        self,
+        scope: Scope,
+        kind: str,
+        reason: str,
+        sid: str,
+        select_name: str,
+        seen: set[int] | None = None,
+    ) -> None:
+        seen = seen or set()
+        for name, source in scope.sources.items():
+            if isinstance(source, exp.Table):
+                self.dependencies.add(
+                    Dependency(kind, self._table_name(source), "*", reason, sid, select_name)
+                )
+            elif isinstance(source, Scope):
+                if source.scope_type == ScopeType.UDTF:
+                    self._unknown("udtf", name, sid)
+                elif id(source) not in self.scope_ids:
+                    self._unknown("recursive_reference", name, sid)
+                elif id(source) in seen:
+                    self._unknown("recursive_reference", name, sid)
+                else:
+                    seen.add(id(source))
+                    self._collect_relation_rows(source, kind, reason, sid, select_name, seen)
+            else:
+                self._unknown("unknown_source", name, sid)
+
+    # Dependency recording
+
+    def _add_column_deps(
+        self,
+        scope: Scope,
+        column: exp.Column,
+        kind: str,
+        reason: str,
+        sid: str,
+        select_name: str = "",
+    ) -> None:
+        for table, name in self._resolve_column(scope, column):
+            self.dependencies.add(Dependency(kind, table, name, reason, sid, select_name))
+
+    def _unknown(self, reason: str, detail: str, sid: str) -> None:
+        self.unknowns.add(Unknown(reason=reason, detail=detail, scope=sid))
+
+    # Resolution of column references down to physical (table, column) leaves
+
+    def _resolve_column(self, scope: Scope, column: exp.Column) -> frozenset:
+        key = ("column", id(scope), column.table, column.name)
+        if key in self._column_cache:
+            return self._column_cache[key]
+        if key in self._resolving:
+            self._unknown(
+                "recursive_reference",
+                column.sql(comments=False, dialect=self.dialect),
+                self.scope_ids[id(scope)],
+            )
+            return frozenset()
+
+        self._resolving.add(key)
+        try:
+            leaves = self._resolve_column_inner(scope, column)
+        finally:
+            self._resolving.discard(key)
+
+        self._column_cache[key] = leaves
+        return leaves
+
+    def _resolve_column_inner(self, scope: Scope, column: exp.Column) -> frozenset:
+        table = column.table
+
+        if not table:
+            # An unqualified reference is usually an output alias used in
+            # GROUP BY / ORDER BY / HAVING
+            projection = self._select_map(scope).get(column.name)
+            if projection is not None:
+                return self._resolve_expression(scope, projection)
+            return self._resolve_unqualified(scope, column)
+
+        source = scope.sources.get(table)
+        if source is None:
+            # Correlated column belonging to an outer query level
+            parent = scope.parent
+            while parent is not None:
+                if table in parent.sources:
+                    return self._resolve_column(parent, column)
+                parent = parent.parent
+            self._unknown("unknown_source", f"{table}.{column.name}", self.scope_ids[id(scope)])
+            return frozenset()
+
+        return self._resolve_source(scope, source, column.name)
+
+    def _resolve_unqualified(self, scope: Scope, column: exp.Column) -> frozenset:
+        sources = scope.sources
+        if len(sources) == 1:
+            return self._resolve_source(scope, next(iter(sources.values())), column.name)
+
+        matches = [
+            source
+            for source in sources.values()
+            if isinstance(source, exp.Table)
+            and column.name in self.schema.column_names(source, only_visible=True)
+        ]
+        if len(matches) == 1:
+            return frozenset({(self._table_name(matches[0]), column.name)})
+
+        self._unknown(
+            "unqualified_column",
+            column.sql(comments=False, dialect=self.dialect),
+            self.scope_ids[id(scope)],
+        )
+        return frozenset()
+
+    def _resolve_source(self, scope: Scope, source: exp.Expr | Scope, name: str) -> frozenset:
+        if isinstance(source, exp.Table):
+            return frozenset({(self._table_name(source), name)})
+        if isinstance(source, Scope):
+            if source.scope_type == ScopeType.UDTF:
+                self._unknown("udtf", name, self.scope_ids[id(scope)])
+                return frozenset()
+            if id(source) not in self.scope_ids:
+                # A source scope outside the traversed tree is the synthetic
+                # base case of a recursive CTE; the recursive step cannot be
+                # resolved statically
+                self._unknown("recursive_reference", name, self.scope_ids[id(scope)])
+                return frozenset()
+            return self._resolve_named_select(source, name)
+
+        self._unknown("unknown_source", name, self.scope_ids[id(scope)])
+        return frozenset()
+
+    def _resolve_named_select(self, scope: Scope, name: str) -> frozenset:
+        key = ("select", id(scope), name)
+        if key in self._select_cache:
+            return self._select_cache[key]
+        if key in self._resolving:
+            self._unknown("recursive_reference", name, self.scope_ids[id(scope)])
+            return frozenset()
+
+        self._resolving.add(key)
+        try:
+            expression = scope.expression
+            if isinstance(expression, exp.Subquery):
+                leaves = self._union(
+                    self._resolve_named_select(s, name) for s in scope.subquery_scopes
+                )
+            elif isinstance(expression, exp.SetOperation):
+                named = expression.named_selects
+                if name in named:
+                    index = named.index(name)
+                    leaves = self._union(
+                        self._resolve_select_index(s, index) for s in scope.set_operation_scopes
+                    )
+                else:
+                    self._unknown("column_not_found", name, self.scope_ids[id(scope)])
+                    leaves = frozenset()
+            elif isinstance(expression, exp.Select):
+                projection = self._select_map(scope).get(name)
+                if projection is not None:
+                    leaves = self._resolve_expression(scope, projection)
+                elif expression.is_star:
+                    leaves = self._resolve_unqualified(scope, exp.column(name))
+                else:
+                    self._unknown("column_not_found", name, self.scope_ids[id(scope)])
+                    leaves = frozenset()
+            else:
+                self._unknown(
+                    "unsupported_scope", type(expression).__name__, self.scope_ids[id(scope)]
+                )
+                leaves = frozenset()
+        finally:
+            self._resolving.discard(key)
+
+        self._select_cache[key] = leaves
+        return leaves
+
+    def _resolve_select_index(self, scope: Scope, index: int) -> frozenset:
+        expression = scope.expression
+        if isinstance(expression, exp.SetOperation):
+            return self._union(
+                self._resolve_select_index(s, index) for s in scope.set_operation_scopes
+            )
+        if isinstance(expression, exp.Subquery):
+            return self._union(self._resolve_select_index(s, index) for s in scope.subquery_scopes)
+
+        selects = t.cast(exp.Select, expression).selects
+        if index >= len(selects):
+            self._unknown("column_not_found", str(index), self.scope_ids[id(scope)])
+            return frozenset()
+        return self._resolve_expression(scope, selects[index])
+
+    def _resolve_expression(self, scope: Scope, expression: exp.Expr) -> frozenset:
+        if isinstance(expression, exp.Star):
+            return self._resolve_star(scope, None)
+        if isinstance(expression, exp.Column) and expression.is_star:
+            return self._resolve_star(scope, expression.table or None)
+
+        leaves: set[tuple[str, str]] = set()
+        for column in find_all_in_scope(expression, exp.Column):
+            leaves |= self._resolve_column(scope, column)
+
+        subquery_scopes = {id(s.expression): s for s in scope.subquery_scopes}
+        for subquery in find_all_in_scope(expression, *exp.UNWRAPPED_QUERIES):
+            subquery_scope = subquery_scopes.get(id(subquery))
+            if subquery_scope is None:
+                self._unknown(
+                    "unknown_subquery",
+                    subquery.sql(comments=False, dialect=self.dialect),
+                    self.scope_ids[id(scope)],
+                )
+                continue
+            for name in subquery.named_selects:
+                leaves |= self._resolve_named_select(subquery_scope, name)
+
+        return frozenset(leaves)
+
+    def _resolve_star(self, scope: Scope, table: str | None) -> frozenset:
+        sid = self.scope_ids[id(scope)]
+        sources = {table: scope.sources.get(table)} if table else scope.sources
+
+        leaves: set[tuple[str, str]] = set()
+        for name, source in sources.items():
+            if isinstance(source, exp.Table):
+                columns = self.schema.column_names(source, only_visible=True)
+                if columns:
+                    leaves.update((self._table_name(source), c) for c in columns)
+                else:
+                    self._unknown("unexpanded_star", f"{name}.*", sid)
+                    leaves.add((self._table_name(source), "*"))
+            elif isinstance(source, Scope):
+                if source.scope_type == ScopeType.UDTF:
+                    self._unknown("udtf", name, sid)
+                    continue
+                expression = source.expression
+                named = expression.named_selects if isinstance(expression, exp.Query) else []
+                for select_name in named:
+                    if select_name == "*":
+                        leaves |= self._resolve_star(source, None)
+                    else:
+                        leaves |= self._resolve_named_select(source, select_name)
+            else:
+                self._unknown("unknown_source", str(name), sid)
+
+        return frozenset(leaves)
+
+    # Helpers
+
+    def _select_map(self, scope: Scope) -> dict[str, exp.Expr]:
+        key = id(scope)
+        select_map = self._select_maps.get(key)
+        if select_map is None:
+            select_map = {}
+            expression = scope.expression
+            if isinstance(expression, exp.Select):
+                for projection in expression.selects:
+                    select_map.setdefault(projection.alias_or_name, projection)
+            self._select_maps[key] = select_map
+        return select_map
+
+    def _table_name(self, table: exp.Table) -> str:
+        name = table.name
+        if table.db:
+            name = f"{table.db}.{name}"
+        if table.catalog:
+            name = f"{table.catalog}.{name}"
+        return name
+
+    @staticmethod
+    def _union(sets: t.Iterable[frozenset]) -> frozenset:
+        return frozenset().union(*sets)
 
 
 def to_node(

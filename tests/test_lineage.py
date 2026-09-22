@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import unittest
 
 import sqlglot
-from sqlglot.lineage import lineage
+from sqlglot.errors import SqlglotError
+from sqlglot.lineage import Dependency, Unknown, dependency_report, lineage
 from sqlglot.schema import MappingSchema
 
 
@@ -1299,3 +1301,227 @@ class TestLineage(unittest.TestCase):
                 seen.add(id(node))
         for nid in seen:
             self.assertEqual(counts.get(nid, 0), 1)
+
+
+class TestDependencyReport(unittest.TestCase):
+    maxDiff = None
+
+    def assertDeps(self, report, *expected) -> None:
+        for dependency in expected:
+            self.assertIn(dependency, report.dependencies)
+
+    def test_value_and_rows_dependencies(self) -> None:
+        report = dependency_report(
+            "SELECT salary FROM staff WHERE region = 'east'",
+            schema={"staff": {"salary": "int", "region": "text"}},
+        )
+        self.assertEqual(
+            report.dependencies,
+            [
+                Dependency("rows", "staff", "region", "where", "q0"),
+                Dependency("value", "staff", "salary", "projection", "q0", "salary"),
+            ],
+        )
+        self.assertEqual(
+            report.by_column(),
+            {"staff.region": ["rows"], "staff.salary": ["value"]},
+        )
+        self.assertEqual(report.unknowns, [])
+
+    def test_join_group_by_having(self) -> None:
+        report = dependency_report(
+            """
+            SELECT c.region, COUNT(*) AS n
+            FROM customers c
+            JOIN orders o ON o.cid = c.id
+            WHERE o.total > 10
+            GROUP BY c.region
+            HAVING COUNT(*) > 2
+            """,
+            schema={
+                "customers": {"id": "int", "region": "text"},
+                "orders": {"id": "int", "cid": "int", "total": "int"},
+            },
+        )
+        self.assertDeps(
+            report,
+            Dependency("rows", "customers", "id", "join", "q0"),
+            Dependency("rows", "orders", "cid", "join", "q0"),
+            Dependency("rows", "orders", "total", "where", "q0"),
+            Dependency("rows", "customers", "region", "group_by", "q0"),
+            # HAVING COUNT(*) filters groups based on the input rows
+            Dependency("rows", "customers", "*", "having", "q0"),
+            Dependency("rows", "orders", "*", "having", "q0"),
+            Dependency("value", "customers", "region", "projection", "q0", "region"),
+        )
+        self.assertEqual(report.unknowns, [])
+
+    def test_count_star_depends_on_rows(self) -> None:
+        report = dependency_report(
+            "SELECT COUNT(*) AS n FROM staff",
+            schema={"staff": {"salary": "int"}},
+        )
+        # COUNT(*) has no column value source but still depends on input rows
+        self.assertEqual(
+            report.dependencies,
+            [Dependency("value", "staff", "*", "projection", "q0", "n")],
+        )
+        self.assertEqual(report.by_column(), {"staff.*": ["value"]})
+
+    def test_distinct(self) -> None:
+        report = dependency_report(
+            "SELECT DISTINCT region FROM staff",
+            schema={"staff": {"region": "text"}},
+        )
+        self.assertDeps(
+            report,
+            Dependency("rows", "staff", "region", "distinct", "q0"),
+            Dependency("value", "staff", "region", "projection", "q0", "region"),
+        )
+
+    def test_window_partition_and_order(self) -> None:
+        report = dependency_report(
+            "SELECT name, ROW_NUMBER() OVER (PARTITION BY region ORDER BY salary) AS rn FROM staff",
+            schema={"staff": {"name": "text", "region": "text", "salary": "int"}},
+        )
+        self.assertDeps(
+            report,
+            Dependency("value", "staff", "region", "window_partition", "q0", "rn"),
+            Dependency("value", "staff", "salary", "window_order", "q0", "rn"),
+            Dependency("value", "staff", "name", "projection", "q0", "name"),
+        )
+        self.assertEqual(report.unknowns, [])
+
+    def test_order_by_with_and_without_limit(self) -> None:
+        schema = {"staff": {"salary": "int"}}
+
+        report = dependency_report("SELECT salary FROM staff ORDER BY salary", schema=schema)
+        self.assertDeps(report, Dependency("order", "staff", "salary", "order_by", "q0"))
+        self.assertEqual(report.by_column()["staff.salary"], ["order", "value"])
+
+        report = dependency_report(
+            "SELECT salary FROM staff ORDER BY salary LIMIT 10", schema=schema
+        )
+        self.assertDeps(report, Dependency("rows", "staff", "salary", "order_by_limit", "q0"))
+        self.assertEqual(report.by_column()["staff.salary"], ["rows", "value"])
+
+    def test_case_condition_is_a_value_dependency(self) -> None:
+        report = dependency_report(
+            "SELECT CASE WHEN region = 'east' THEN salary ELSE 0 END AS s FROM staff",
+            schema={"staff": {"salary": "int", "region": "text"}},
+        )
+        self.assertDeps(
+            report,
+            Dependency("value", "staff", "region", "case_condition", "q0", "s"),
+            Dependency("value", "staff", "salary", "projection", "q0", "s"),
+        )
+        # The CASE condition feeds the computed value, not the query's row set
+        self.assertEqual(report.by_column()["staff.region"], ["value"])
+
+    def test_traces_through_cte_and_union(self) -> None:
+        report = dependency_report(
+            """
+            WITH filtered AS (
+                SELECT salary, region FROM staff WHERE active = 1
+            )
+            SELECT salary FROM filtered
+            UNION
+            SELECT bonus FROM payouts
+            """,
+            schema={
+                "staff": {"salary": "int", "region": "text", "active": "int"},
+                "payouts": {"bonus": "int"},
+            },
+        )
+        # Output values trace to physical columns on both union branches
+        self.assertDeps(
+            report,
+            Dependency("value", "staff", "salary", "projection", "q1", "salary"),
+            Dependency("value", "staff", "salary", "projection", "q2", "salary"),
+            Dependency("value", "payouts", "bonus", "projection", "q3", "bonus"),
+            Dependency("rows", "staff", "active", "where", "q1"),
+        )
+        self.assertEqual(report.unknowns, [])
+
+        # Every dependency is attributed to a stable, documented query level
+        for dependency in report.dependencies:
+            self.assertIn(dependency.scope, report.scopes)
+        self.assertIn("UNION", report.scopes["q0"])
+        self.assertIn("staff.active = 1", report.scopes["q1"])
+
+    def test_subquery_in_where(self) -> None:
+        report = dependency_report(
+            "SELECT salary FROM staff WHERE region IN (SELECT region FROM regions)",
+            schema={"staff": {"salary": "int", "region": "text"}, "regions": {"region": "text"}},
+        )
+        self.assertDeps(
+            report,
+            Dependency("rows", "staff", "region", "where", "q0"),
+            Dependency("rows", "regions", "region", "where", "q1"),
+        )
+        self.assertNotEqual(report.scopes["q0"], report.scopes["q1"])
+
+    def test_star_expansion_with_schema(self) -> None:
+        report = dependency_report(
+            "SELECT * FROM staff",
+            schema={"staff": {"salary": "int", "region": "text"}},
+        )
+        self.assertDeps(
+            report,
+            Dependency("value", "staff", "salary", "projection", "q0", "salary"),
+            Dependency("value", "staff", "region", "projection", "q0", "region"),
+        )
+        self.assertEqual(report.unknowns, [])
+
+    def test_unexpanded_star_is_unknown(self) -> None:
+        report = dependency_report("SELECT * FROM staff")
+        self.assertEqual(
+            report.dependencies,
+            [Dependency("value", "staff", "*", "projection", "q0", "*")],
+        )
+        self.assertEqual(
+            report.unknowns,
+            [Unknown("unexpanded_star", "staff.*", "q0")],
+        )
+
+    def test_recursive_cte_is_unknown(self) -> None:
+        report = dependency_report(
+            "WITH RECURSIVE r AS (SELECT a AS x FROM t UNION ALL SELECT x + 1 FROM r) SELECT x FROM r",
+            schema={"t": {"a": "int"}},
+        )
+        # The base case still traces to the physical column
+        self.assertDeps(report, Dependency("value", "t", "a", "projection", "q0", "x"))
+        # The recursive step is reported as unknown instead of faking no dependencies
+        self.assertEqual(
+            [u.reason for u in report.unknowns],
+            ["recursive_reference"],
+        )
+
+    def test_udtf_is_unknown(self) -> None:
+        report = dependency_report("SELECT a FROM UNNEST(arr) AS t(a)")
+        self.assertEqual([u.reason for u in report.unknowns], ["udtf"])
+
+    def test_report_is_stable_and_serializable(self) -> None:
+        sql = "SELECT salary FROM staff WHERE region = 'east' ORDER BY salary LIMIT 3"
+        schema = {"staff": {"salary": "int", "region": "text"}}
+
+        report = dependency_report(sql, schema=schema)
+        self.assertEqual(report.to_dict(), dependency_report(sql, schema=schema).to_dict())
+
+        # Round-trips through JSON; identities are deterministic strings,
+        # not Python memory addresses
+        decoded = json.loads(report.to_json())
+        self.assertEqual(decoded["dependencies"][0]["scope"], "q0")
+        self.assertEqual(
+            report.by_column(),
+            {"staff.region": ["rows"], "staff.salary": ["rows", "value"]},
+        )
+
+    def test_input_tree_is_not_modified(self) -> None:
+        ast = sqlglot.parse_one("SELECT a FROM t")
+        dependency_report(ast)
+        self.assertEqual(ast.sql(), "SELECT a FROM t")
+
+    def test_non_query_raises(self) -> None:
+        with self.assertRaises(SqlglotError):
+            dependency_report("1")
