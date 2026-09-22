@@ -34,6 +34,10 @@ class UnsupportedError(SqlglotError):
     pass
 
 
+class ParamError(SqlglotError):
+    pass
+
+
 class ParseError(SqlglotError):
     def __init__(
         self,

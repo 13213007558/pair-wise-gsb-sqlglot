@@ -18,6 +18,7 @@ from sqlglot.dialects.dialect import Dialect as Dialect, Dialects as Dialects
 from sqlglot.diff import diff as diff
 from sqlglot.errors import (
     ErrorLevel as ErrorLevel,
+    ParamError as ParamError,
     ParseError as ParseError,
     TokenError as TokenError,
     UnsupportedError as UnsupportedError,
@@ -50,6 +51,11 @@ from sqlglot.expressions import (
     union as union,
 )
 from sqlglot.generator import Generator as Generator
+from sqlglot.params import (
+    generate_params as generate_params,
+    parse_params as parse_params,
+    transpile_params as transpile_params,
+)
 from sqlglot.parser import Parser as Parser
 from sqlglot.schema import MappingSchema as MappingSchema, Schema as Schema
 from sqlglot.tokens import Token as Token, Tokenizer as Tokenizer, TokenType as TokenType

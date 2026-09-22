@@ -193,6 +193,34 @@ SELECT
 FROM bar /* comment 5 */, tbl /*          comment 6 */
 ```
 
+### Transpiling Bind Parameters
+
+Statements with bind parameters can be transpiled together with their values, so values are always passed to the driver separately from the generated SQL. Named (:name), qmark (?) and numeric (:1) styles are supported for both input and output:
+
+```python
+import sqlglot
+
+# Each placeholder position of the target SQL gets its source value, even when
+# transpilation duplicates or reorders the expressions parameters belong to
+sqlglot.transpile_params(
+    "SELECT * FROM t WHERE a = :x OR b = :x",
+    read="sqlite",
+    write="duckdb",
+    params={"x": 1},
+    output_style="qmark",
+)
+```
+
+```python
+('SELECT * FROM t WHERE a = ? OR b = ?', [1, 1])
+```
+
+To reuse a parsed statement for multiple targets, pair parse_params with generate_params:
+
+```python
+expression, keys = sqlglot.parse_params("SELECT * FROM t WHERE a = :x", read="sqlite")
+sqlglot.generate_params(expression, keys, {"x": 1}, write="duckdb", output_style="qmark")
+```
 
 ### Metadata
 
