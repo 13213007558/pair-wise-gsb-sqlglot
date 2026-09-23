@@ -3,8 +3,14 @@ from __future__ import annotations
 import unittest
 
 import sqlglot
-from sqlglot.lineage import lineage
+from sqlglot.errors import SqlglotError
+from sqlglot.lineage import Node, WriteLineage, lineage, write_lineage
 from sqlglot.schema import MappingSchema
+
+try:
+    import duckdb
+except ImportError:
+    duckdb = None
 
 
 class TestLineage(unittest.TestCase):
@@ -1299,3 +1305,338 @@ class TestLineage(unittest.TestCase):
                 seen.add(id(node))
         for nid in seen:
             self.assertEqual(counts.get(nid, 0), 1)
+
+
+def _leaf_names(node: Node) -> list[str]:
+    return sorted(n.name for n in node.walk() if not n.downstream and n is not node)
+
+
+class TestWriteLineage(unittest.TestCase):
+    maxDiff = None
+
+    def test_insert_select(self) -> None:
+        result = write_lineage(
+            "INSERT INTO t (a, b) SELECT x, y FROM s",
+            schema={"s": {"x": "int", "y": "int"}},
+        )
+        self.assertIsInstance(result, WriteLineage)
+        self.assertEqual(result.target.sql(), "t")
+        self.assertEqual(result.target_columns, ["a", "b"])
+
+        branch = result.branches[0]
+        self.assertEqual(branch.kind, "INSERT")
+        self.assertEqual(list(branch.columns), ["a", "b"])
+        self.assertEqual(branch.columns["a"].payload["kind"], "source")
+        self.assertEqual(_leaf_names(branch.columns["a"]), ["s.x"])
+        self.assertEqual(_leaf_names(branch.columns["b"]), ["s.y"])
+
+    def test_insert_select_schema_order(self) -> None:
+        # Without an explicit column list, target columns follow the schema order
+        result = write_lineage(
+            "INSERT INTO t SELECT y, x FROM s",
+            schema={"t": {"a": "int", "b": "int"}, "s": {"x": "int", "y": "int"}},
+        )
+        branch = result.branches[0]
+        self.assertEqual(list(branch.columns), ["a", "b"])
+        self.assertEqual(_leaf_names(branch.columns["a"]), ["s.y"])
+        self.assertEqual(_leaf_names(branch.columns["b"]), ["s.x"])
+
+    def test_insert_values(self) -> None:
+        result = write_lineage("INSERT INTO t (a, b, c) VALUES (1, 'x', DEFAULT), (2, 'y', 3)")
+        branch = result.branches[0]
+        self.assertEqual(branch.kind, "INSERT")
+
+        for name in ("a", "b", "c"):
+            self.assertEqual(branch.columns[name].payload["kind"], "values")
+
+        self.assertEqual(
+            [leaf.payload["kind"] for leaf in branch.columns["a"].downstream],
+            ["constant", "constant"],
+        )
+        self.assertEqual(
+            [leaf.payload["kind"] for leaf in branch.columns["c"].downstream],
+            ["default", "constant"],
+        )
+        self.assertEqual(branch.columns["c"].downstream[0].name, "DEFAULT")
+
+    def test_insert_star(self) -> None:
+        result = write_lineage(
+            "INSERT INTO t SELECT * FROM s",
+            schema={"t": {"a": "int", "b": "int"}, "s": {"a": "int", "b": "int"}},
+        )
+        branch = result.branches[0]
+        self.assertEqual(list(branch.columns), ["a", "b"])
+        self.assertEqual(_leaf_names(branch.columns["a"]), ["s.a"])
+        self.assertEqual(_leaf_names(branch.columns["b"]), ["s.b"])
+
+    def test_insert_cte_union(self) -> None:
+        result = write_lineage(
+            "WITH c AS (SELECT a FROM x) INSERT INTO t (a) SELECT a FROM c UNION ALL SELECT a FROM y",
+            schema={"x": {"a": "int"}, "y": {"a": "int"}},
+        )
+        node = result.branches[0].columns["a"]
+        self.assertEqual(_leaf_names(node), ["x.a", "y.a"])
+        self.assertIn("UNION", {n.name for n in node.walk()})
+
+    def test_insert_subquery_alias_shadowing(self) -> None:
+        # The derived table alias "s" shadows the real table "s" inside the query
+        result = write_lineage(
+            "INSERT INTO t (a) SELECT s.a FROM (SELECT a FROM x) AS s",
+            schema={"x": {"a": "int"}, "s": {"a": "int"}},
+        )
+        node = result.branches[0].columns["a"]
+        self.assertEqual(_leaf_names(node), ["x.a"])
+
+    def test_insert_errors(self) -> None:
+        # Column count mismatch
+        with self.assertRaises(SqlglotError) as ctx:
+            write_lineage(
+                "INSERT INTO t (a) SELECT a, b FROM s", schema={"s": {"a": "int", "b": "int"}}
+            )
+        self.assertIn("Column count mismatch", str(ctx.exception))
+        self.assertIn("INSERT INTO t (a)", str(ctx.exception))
+
+        # Missing schema for the target table without a column list
+        with self.assertRaises(SqlglotError) as ctx:
+            write_lineage("INSERT INTO t SELECT a FROM s", schema={"s": {"a": "int"}})
+        self.assertIn("INSERT INTO t", str(ctx.exception))
+
+        # Missing schema to expand the star
+        with self.assertRaises(SqlglotError) as ctx:
+            write_lineage("INSERT INTO t SELECT * FROM s", schema={"t": {"a": "int"}})
+        self.assertIn("*", str(ctx.exception))
+
+        # Not a DML statement
+        with self.assertRaises(SqlglotError):
+            write_lineage("SELECT a FROM s")
+
+        # VALUES row arity mismatch
+        with self.assertRaises(SqlglotError) as ctx:
+            write_lineage("INSERT INTO t (a, b) VALUES (1, 2, 3)")
+        self.assertIn("Column count mismatch", str(ctx.exception))
+
+    def test_update_swap_columns(self) -> None:
+        # Each SET assignment reads the pre-update row, so swapping two columns
+        # must trace each target column to the other column's old value
+        result = write_lineage(
+            "UPDATE t SET a = b, b = a",
+            schema={"t": {"a": "int", "b": "int"}},
+            dialect="postgres",
+        )
+        branch = result.branches[0]
+        self.assertEqual(branch.kind, "UPDATE")
+        self.assertEqual(_leaf_names(branch.columns["a"]), ["t.b"])
+        self.assertEqual(_leaf_names(branch.columns["b"]), ["t.a"])
+
+    def test_update_from(self) -> None:
+        result = write_lineage(
+            "UPDATE t SET a = s.x FROM s WHERE t.id = s.id",
+            schema={"t": {"a": "int", "id": "int"}, "s": {"x": "int", "id": "int"}},
+            dialect="postgres",
+        )
+        branch = result.branches[0]
+        self.assertEqual(_leaf_names(branch.columns["a"]), ["s.x"])
+
+        # The WHERE clause is a control dependency, not a value source
+        self.assertIsNotNone(branch.condition)
+        self.assertEqual(branch.condition.sql(dialect="postgres"), "WHERE t.id = s.id")
+        self.assertNotIn("t.id", _leaf_names(branch.columns["a"]))
+
+        # The unassigned column keeps its old value
+        self.assertEqual(branch.columns["id"].payload["kind"], "kept")
+        self.assertEqual(branch.columns["id"].downstream, [])
+
+    def test_update_constant_and_default(self) -> None:
+        result = write_lineage(
+            "UPDATE t SET a = 1, b = DEFAULT",
+            schema={"t": {"a": "int", "b": "int"}},
+            dialect="postgres",
+        )
+        branch = result.branches[0]
+        self.assertEqual(branch.columns["a"].payload["kind"], "constant")
+        self.assertEqual(branch.columns["b"].payload["kind"], "default")
+
+    def test_update_duplicate_assignment(self) -> None:
+        with self.assertRaises(SqlglotError) as ctx:
+            write_lineage("UPDATE t SET a = 1, a = 2", dialect="postgres")
+        self.assertIn("UPDATE t SET a = 1, a = 2", str(ctx.exception))
+
+    def test_update_subquery_and_cte(self) -> None:
+        result = write_lineage(
+            "WITH c AS (SELECT MAX(x) AS m FROM s) UPDATE t SET a = (SELECT m FROM c)",
+            schema={"t": {"a": "int"}, "s": {"x": "int"}},
+            dialect="postgres",
+        )
+        self.assertEqual(_leaf_names(result.branches[0].columns["a"]), ["s.x"])
+
+    def test_merge_insert_update_delete(self) -> None:
+        result = write_lineage(
+            """
+            MERGE INTO t AS tgt
+            USING s AS src
+            ON tgt.id = src.id
+            WHEN MATCHED AND src.y > 0 THEN UPDATE SET a = src.x
+            WHEN NOT MATCHED THEN INSERT (id, a) VALUES (src.id, 0)
+            WHEN NOT MATCHED BY SOURCE THEN DELETE
+            """,
+            schema={
+                "t": {"id": "int", "a": "int"},
+                "s": {"id": "int", "x": "int", "y": "int"},
+            },
+            dialect="postgres",
+        )
+        self.assertEqual(
+            [branch.kind for branch in result.branches], ["UPDATE", "INSERT", "DELETE"]
+        )
+        update, insert, delete = result.branches
+
+        # Each branch keeps its own condition and action
+        self.assertEqual(update.condition.sql(dialect="postgres"), "src.y > 0")
+        self.assertIsNone(insert.condition)
+        self.assertIsNone(delete.condition)
+        self.assertEqual(result.on.sql(dialect="postgres"), "tgt.id = src.id")
+
+        # UPDATE branch: value from the source, unassigned column kept
+        self.assertEqual(_leaf_names(update.columns["a"]), ["src.x"])
+        self.assertEqual(update.columns["id"].payload["kind"], "kept")
+
+        # INSERT branch: one source column, one constant
+        self.assertEqual(_leaf_names(insert.columns["id"]), ["src.id"])
+        self.assertEqual(insert.columns["a"].payload["kind"], "constant")
+
+        # DELETE branch writes no columns
+        self.assertEqual(delete.columns, {})
+
+        # Control dependencies (ON, WHEN ... AND) are not value sources
+        value_leaves = set()
+        for branch in result.branches:
+            for node in branch.columns.values():
+                value_leaves.update(_leaf_names(node))
+        self.assertNotIn("tgt.id", value_leaves)
+        self.assertNotIn("src.y", value_leaves)
+
+    def test_merge_subquery_using(self) -> None:
+        result = write_lineage(
+            "MERGE INTO t USING (SELECT id, x FROM s) AS src ON t.id = src.id "
+            "WHEN MATCHED THEN UPDATE SET a = src.x",
+            schema={"t": {"id": "int", "a": "int"}, "s": {"id": "int", "x": "int"}},
+            dialect="postgres",
+        )
+        self.assertEqual(_leaf_names(result.branches[0].columns["a"]), ["s.x"])
+
+    def test_merge_insert_schema_order(self) -> None:
+        result = write_lineage(
+            "MERGE INTO t USING s ON t.id = s.id "
+            "WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.x)",
+            schema={"t": {"id": "int", "a": "int"}, "s": {"id": "int", "x": "int"}},
+            dialect="postgres",
+        )
+        branch = result.branches[0]
+        self.assertEqual(list(branch.columns), ["id", "a"])
+        self.assertEqual(_leaf_names(branch.columns["a"]), ["s.x"])
+
+    def test_write_lineage_sql_not_modified(self) -> None:
+        sql = "UPDATE t SET a = b, b = a"
+        ast = sqlglot.parse_one(sql, dialect="postgres")
+        write_lineage(ast, schema={"t": {"a": "int", "b": "int"}}, dialect="postgres")
+        self.assertEqual(ast.sql(), sql)
+
+    def test_lineage_rejects_dml(self) -> None:
+        with self.assertRaises(SqlglotError) as ctx:
+            lineage("a", "UPDATE t SET a = 1")
+        self.assertIn("write_lineage", str(ctx.exception))
+
+    @unittest.skipIf(duckdb is None, "duckdb is not installed")
+    def test_write_lineage_duckdb(self) -> None:
+        con = duckdb.connect()
+        con.execute("CREATE TABLE s (id INTEGER, x INTEGER, y INTEGER)")
+        con.execute("INSERT INTO s VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)")
+        con.execute("CREATE TABLE t (id INTEGER, a INTEGER, b INTEGER)")
+        con.execute("INSERT INTO t VALUES (1, 7, 8), (2, 9, 10)")
+
+        schema = {
+            "t": {"id": "int", "a": "int", "b": "int"},
+            "s": {"id": "int", "x": "int", "y": "int"},
+        }
+
+        # UPDATE swapping two columns: the graph's source for each target column
+        # must match what DuckDB actually writes
+        swap_sql = "UPDATE t SET a = b, b = a"
+        result = write_lineage(swap_sql, schema=schema, dialect="duckdb")
+
+        columns = ["id", "a", "b"]
+        before = {row[0]: row for row in con.execute("SELECT id, a, b FROM t").fetchall()}
+        con.execute(swap_sql)
+        after = {row[0]: row for row in con.execute("SELECT id, a, b FROM t").fetchall()}
+
+        branch = result.branches[0]
+        for name, node in branch.columns.items():
+            if node.payload["kind"] == "kept":
+                for row_id in before:
+                    self.assertEqual(
+                        after[row_id][columns.index(name)],
+                        before[row_id][columns.index(name)],
+                    )
+                continue
+            leaves = _leaf_names(node)
+            self.assertEqual(len(leaves), 1)
+            source_column = leaves[0].split(".")[-1]
+            for row_id in before:
+                self.assertEqual(
+                    after[row_id][columns.index(name)],
+                    before[row_id][columns.index(source_column)],
+                )
+
+        # MERGE with INSERT, UPDATE, and DELETE branches
+        con.execute("CREATE TABLE mt (id INTEGER, a INTEGER)")
+        con.execute("INSERT INTO mt VALUES (1, 100), (2, 200)")
+        con.execute("CREATE TABLE ms (id INTEGER, x INTEGER)")
+        con.execute("INSERT INTO ms VALUES (2, 20), (3, 30)")
+
+        merge_sql = """
+            MERGE INTO mt AS t
+            USING ms AS s
+            ON t.id = s.id
+            WHEN MATCHED AND s.x < 0 THEN DELETE
+            WHEN MATCHED THEN UPDATE SET a = s.x
+            WHEN NOT MATCHED THEN INSERT (id, a) VALUES (s.id, -1)
+        """
+        merge_schema = {"mt": {"id": "int", "a": "int"}, "ms": {"id": "int", "x": "int"}}
+        result = write_lineage(merge_sql, schema=merge_schema, dialect="duckdb")
+        self.assertEqual(
+            [branch.kind for branch in result.branches], ["DELETE", "UPDATE", "INSERT"]
+        )
+        delete_branch, update_branch, insert_branch = result.branches
+
+        before_mt = con.execute("SELECT id, a FROM mt").fetchall()
+        ms_rows = con.execute("SELECT id, x FROM ms").fetchall()
+        con.execute(merge_sql)
+        actual = con.execute("SELECT id, a FROM mt ORDER BY id").fetchall()
+
+        # Recompute the expected target rows from the graph and DuckDB's source
+        # data, then compare them against what DuckDB actually wrote
+        self.assertEqual(_leaf_names(update_branch.columns["a"]), ["s.x"])
+        self.assertEqual(_leaf_names(insert_branch.columns["id"]), ["s.id"])
+        self.assertEqual(insert_branch.columns["a"].payload["kind"], "constant")
+        insert_constant = insert_branch.action.expression.expressions[1].to_py()
+
+        mt_ids = {row[0] for row in before_mt}
+        ms_ids = {row[0] for row in ms_rows}
+        expected = {}
+        for row_id, a in before_mt:
+            if row_id not in ms_ids:
+                expected[row_id] = a  # no branch applies: the old value is kept
+        for source_id, _ in ms_rows:
+            if source_id in mt_ids:
+                deleted = con.execute(
+                    f"SELECT {delete_branch.condition.sql(dialect='duckdb')} "
+                    f"FROM ms AS s WHERE s.id = {source_id}"
+                ).fetchone()[0]
+                if not deleted:
+                    expected[source_id] = con.execute(
+                        f"SELECT s.x FROM ms AS s WHERE s.id = {source_id}"
+                    ).fetchone()[0]
+            else:
+                expected[source_id] = insert_constant
+
+        self.assertEqual(actual, sorted(expected.items()))

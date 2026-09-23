@@ -78,6 +78,58 @@ class Node:
         return GraphHTML(nodes, edges, **opts)
 
 
+@dataclass(frozen=True)
+class WriteBranch:
+    """A single write action of a DML statement.
+
+    Attributes:
+        kind: The action performed by this branch: "INSERT", "UPDATE", or "DELETE".
+        columns: A mapping of target column name to the lineage Node of the value
+            written into it. Empty for DELETE branches. Each Node's payload["kind"]
+            classifies the written value: "source" (traced from a source table or
+            query), "constant", "default", "values" (an INSERT ... VALUES row), or
+            "kept" (the target column is not assigned, so its old value is kept).
+        condition: The control dependency of this branch (the WHEN ... AND condition
+            of a MERGE branch, or the WHERE clause of an UPDATE). Columns referenced
+            here only decide which rows are written; they are not value sources and
+            are therefore kept out of "columns".
+        action: The parsed action expression of this branch.
+    """
+
+    kind: str
+    columns: dict[str, Node] = field(default_factory=dict)
+    condition: exp.Expr | None = None
+    action: exp.Expr | None = None
+
+
+@dataclass(frozen=True)
+class WriteLineage:
+    """The write lineage of an INSERT, UPDATE, or MERGE statement.
+
+    Attributes:
+        statement: The parsed DML statement.
+        target: The table being written to.
+        branches: The write actions of the statement, in order of appearance.
+        on: The ON clause of a MERGE statement. Like WriteBranch.condition, this
+            is a control dependency and is not part of any column's value lineage.
+    """
+
+    statement: exp.Expr
+    target: exp.Table
+    branches: list[WriteBranch] = field(default_factory=list)
+    on: exp.Expr | None = None
+
+    @property
+    def target_columns(self) -> list[str]:
+        """The names of all target columns written by the statement, in write order."""
+        columns: list[str] = []
+        for branch in self.branches:
+            for name in branch.columns:
+                if name not in columns:
+                    columns.append(name)
+        return columns
+
+
 @t.overload
 def lineage(column: str | exp.Column, sql: str | exp.Expr, **kwargs: t.Any) -> Node: ...
 
@@ -122,6 +174,9 @@ def lineage(
         A Node when `column` is provided, or a dict[str, Node] when `column` is None.
     """
     expression = maybe_parse(sql, copy=copy, dialect=dialect)
+
+    if isinstance(expression, (exp.Update, exp.Merge)):
+        raise SqlglotError("Cannot build lineage for a DML statement, use write_lineage instead.")
 
     if sources:
         expression = exp.expand(
@@ -191,6 +246,77 @@ def lineage(
         )
 
     return result
+
+
+def write_lineage(
+    sql: str | exp.Expr,
+    schema: dict | Schema | None = None,
+    sources: Mapping[str, str | exp.Query] | None = None,
+    dialect: DialectType = None,
+    copy: bool = True,
+    trim_selects: bool = True,
+    on_node: t.Callable[[Node], None] | None = None,
+    **kwargs,
+) -> WriteLineage:
+    """Build the write lineage of an INSERT, UPDATE, or MERGE statement.
+
+    For every column of the target table written by the statement, this traces the
+    written value back to its sources: a source query (INSERT ... SELECT), a VALUES
+    row, a constant, DEFAULT, a source table expression (UPDATE ... FROM, MERGE), or
+    the target row's own previous value for columns the statement doesn't assign.
+
+    UPDATE assignments all read the pre-update row, so e.g. swapping two columns
+    with SET a = b, b = a correctly traces each target column to the other column's
+    old value. MERGE keeps every WHEN branch's condition and action separate, and
+    control dependencies (ON / WHEN / WHERE clauses) are never mixed into the value
+    lineage of a target column.
+
+    Args:
+        sql: The INSERT, UPDATE, or MERGE statement, as a SQL string or expression.
+        schema: The schema of tables. Required to resolve target columns when an
+            INSERT omits its column list, and to report columns whose old value is
+            kept by an UPDATE.
+        sources: A mapping of queries which will be used to continue building lineage.
+        dialect: The dialect of input SQL.
+        copy: Whether to copy the Expr arguments.
+        trim_selects: Whether to clean up selects by trimming to only relevant columns.
+        on_node: Optional callback invoked for every Node created during the walk,
+            after the Node's downstream is populated.
+        **kwargs: Qualification optimizer kwargs.
+
+    Returns:
+        The WriteLineage of the statement.
+    """
+    statement = maybe_parse(sql, copy=copy, dialect=dialect)
+
+    if sources:
+        statement = exp.expand(
+            statement,
+            {
+                k: t.cast(exp.Query, maybe_parse(v, copy=copy, dialect=dialect))
+                for k, v in sources.items()
+            },
+            dialect=dialect,
+            copy=copy,
+        )
+
+    tracer = _WriteTracer(
+        schema=ensure_schema(schema, dialect=dialect),
+        dialect=dialect,
+        sql=statement.sql(dialect=dialect),
+        trim_selects=trim_selects,
+        on_node=on_node,
+        qualify_kwargs=kwargs,
+    )
+
+    if isinstance(statement, exp.Insert):
+        return tracer.insert(statement)
+    if isinstance(statement, exp.Update):
+        return tracer.update(statement)
+    if isinstance(statement, exp.Merge):
+        return tracer.merge(statement)
+
+    raise SqlglotError("Cannot build write lineage, sql must be INSERT, UPDATE, or MERGE")
 
 
 def to_node(
@@ -495,6 +621,387 @@ def to_node(
         on_node(node)
 
     return node
+
+
+class _WriteTracer:
+    """Traces the values written by a DML statement back to their sources.
+
+    Value expressions (UPDATE SET right-hand sides, MERGE ... VALUES, etc.) are
+    traced by assembling a synthetic SELECT over the statement's sources and
+    reusing to_node, so CTEs, subqueries, aliases, stars, and set operations
+    resolve exactly as they do for SELECT lineage. Every synthetic SELECT reads
+    the raw source tables, which is what makes UPDATE assignments see the
+    pre-update row rather than each other's results.
+    """
+
+    def __init__(
+        self,
+        schema: Schema,
+        dialect: DialectType,
+        sql: str,
+        trim_selects: bool,
+        on_node: t.Callable[[Node], None] | None,
+        qualify_kwargs: dict[str, t.Any],
+    ):
+        self.schema = schema
+        self.dialect = dialect
+        self.sql = sql
+        self.trim_selects = trim_selects
+        self.on_node = on_node
+        self.qualify_kwargs = qualify_kwargs
+        self.cache: dict[tuple, Node] = {}
+        self.scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] = {}
+
+    def insert(self, insert: exp.Insert) -> WriteLineage:
+        target, columns = self._insert_target(insert)
+        query = insert.expression
+
+        if query is None:
+            raise SqlglotError(
+                f"Cannot build write lineage for {self.sql}: INSERT has no source query"
+            )
+
+        if isinstance(query, exp.Values):
+            branch_columns = self._values_columns(insert, query, columns)
+        elif isinstance(query, exp.Query):
+            with_ = insert.args.get("with_")
+            if with_ is not None and query.args.get("with_") is None:
+                query.set("with_", with_)
+
+            scope = self._build_scope(query)
+            selects = query.selects
+
+            if any(isinstance(select, exp.Star) for select in selects):
+                raise SqlglotError(
+                    f"Cannot expand * in {query.sql(dialect=self.dialect)}: "
+                    "provide a schema for the source tables"
+                )
+            if len(selects) != len(columns):
+                raise SqlglotError(
+                    f"Column count mismatch in {self.sql}: "
+                    f"{len(columns)} target columns but the source query produces {len(selects)}"
+                )
+
+            branch_columns = {}
+            for index, name in enumerate(columns):
+                node = self._target_node(name, insert, selects[index])
+                branch_columns[name] = node
+                self._to_node(index, scope, upstream=node)
+                self._emit(node)
+        else:
+            raise SqlglotError(
+                f"Cannot build write lineage for {self.sql}: "
+                f"unsupported source {query.sql(dialect=self.dialect)}"
+            )
+
+        branch = WriteBranch(kind="INSERT", columns=branch_columns, action=insert)
+        return WriteLineage(statement=insert, target=target, branches=[branch])
+
+    def update(self, update: exp.Update) -> WriteLineage:
+        target = update.this
+        if not isinstance(target, exp.Table):
+            raise SqlglotError(
+                f"Cannot build write lineage for {self.sql}: UPDATE must target a table"
+            )
+
+        sources: list[exp.Expr] = [target]
+        from_ = update.args.get("from_")
+        if from_:
+            sources.extend(_from_sources(from_))
+
+        columns = self._set_columns(update, sources, update)
+        self._add_kept_columns(columns, target)
+
+        branch = WriteBranch(
+            kind="UPDATE",
+            columns=columns,
+            condition=update.args.get("where"),
+            action=update,
+        )
+        return WriteLineage(statement=update, target=target, branches=[branch])
+
+    def merge(self, merge: exp.Merge) -> WriteLineage:
+        target = merge.this
+        using = merge.args.get("using")
+        whens = merge.args.get("whens")
+
+        if not isinstance(target, exp.Table) or using is None or whens is None:
+            raise SqlglotError(
+                f"Cannot build write lineage for {self.sql}: "
+                "MERGE must target a table with a USING source and WHEN clauses"
+            )
+
+        branches = []
+        for when in whens.expressions:
+            matched = when.args["matched"]
+            by_source = bool(when.args.get("source"))
+            then = when.args["then"]
+
+            # NOT MATCHED [BY TARGET] branches only see the source row, NOT MATCHED
+            # BY SOURCE branches only see the target row, MATCHED branches see both
+            sources: list[exp.Expr] = []
+            if matched or by_source:
+                sources.append(target)
+            if matched or not by_source:
+                sources.append(using)
+
+            if isinstance(then, exp.Update):
+                kind = "UPDATE"
+                columns = self._set_columns(then, sources, merge)
+                self._add_kept_columns(columns, target)
+            elif isinstance(then, exp.Insert):
+                kind = "INSERT"
+                columns = self._merge_insert_columns(merge, then, target, sources)
+            else:
+                kind = "DELETE"
+                columns = {}
+
+            branches.append(
+                WriteBranch(
+                    kind=kind,
+                    columns=columns,
+                    condition=when.args.get("condition"),
+                    action=then,
+                )
+            )
+
+        return WriteLineage(
+            statement=merge,
+            target=target,
+            branches=branches,
+            on=merge.args.get("on"),
+        )
+
+    def _insert_target(self, insert: exp.Insert) -> tuple[exp.Table, list[str]]:
+        this = insert.this
+        if isinstance(this, exp.Schema) and isinstance(this.this, exp.Table):
+            return this.this, [column.name for column in this.expressions]
+
+        if isinstance(this, exp.Table):
+            columns = list(self.schema.column_names(this, only_visible=True))
+            if not columns:
+                raise SqlglotError(
+                    f"Cannot determine the target columns of {self.sql}: "
+                    f"add an explicit column list or provide a schema for table "
+                    f"'{this.sql(dialect=self.dialect)}'"
+                )
+            return this, columns
+
+        raise SqlglotError(f"Cannot build write lineage for {self.sql}: INSERT must target a table")
+
+    def _values_columns(
+        self, insert: exp.Insert, values: exp.Values, columns: list[str]
+    ) -> dict[str, Node]:
+        rows = values.expressions
+        for row in rows:
+            if not isinstance(row, exp.Tuple) or len(row.expressions) != len(columns):
+                raise SqlglotError(
+                    f"Column count mismatch in {self.sql}: "
+                    f"{len(columns)} target columns but row {row.sql(dialect=self.dialect)} "
+                    f"produces {len(row.expressions) if isinstance(row, exp.Tuple) else 1}"
+                )
+
+        result = {}
+        for index, name in enumerate(columns):
+            node = Node(
+                name=name,
+                source=insert,
+                expression=exp.column(name),
+                payload={"kind": "values"},
+            )
+            result[name] = node
+            for row in t.cast(list[exp.Tuple], rows):
+                value = row.expressions[index]
+                leaf = Node(
+                    name=value.sql(comments=False),
+                    source=values,
+                    expression=value,
+                    payload={"kind": _value_kind(value)},
+                )
+                node.downstream.append(leaf)
+                self._emit(leaf)
+            self._emit(node)
+
+        return result
+
+    def _set_columns(
+        self, update: exp.Update, sources: list[exp.Expr], statement: exp.Expr
+    ) -> dict[str, Node]:
+        columns = []
+        values = []
+        for assignment in update.expressions:
+            if not isinstance(assignment, exp.EQ) or not isinstance(assignment.this, exp.Column):
+                raise SqlglotError(
+                    f"Cannot build write lineage for {self.sql}: "
+                    f"unsupported SET assignment {assignment.sql(dialect=self.dialect)}"
+                )
+            columns.append(assignment.this.name)
+            values.append(assignment.expression)
+
+        if len(set(columns)) != len(columns):
+            raise SqlglotError(
+                f"Cannot build write lineage for {self.sql}: "
+                "a target column is assigned more than once"
+            )
+
+        return self._trace_values(columns, values, sources, statement)
+
+    def _merge_insert_columns(
+        self, merge: exp.Merge, insert: exp.Insert, target: exp.Table, sources: list[exp.Expr]
+    ) -> dict[str, Node]:
+        column_list = insert.this
+        if isinstance(column_list, exp.Tuple):
+            columns = [column.name for column in column_list.expressions]
+        elif column_list is None:
+            columns = list(self.schema.column_names(target, only_visible=True))
+            if not columns:
+                raise SqlglotError(
+                    f"Cannot determine the target columns of {self.sql}: "
+                    "add an explicit column list to the INSERT branch or provide a "
+                    f"schema for table '{target.sql(dialect=self.dialect)}'"
+                )
+        else:
+            raise SqlglotError(
+                f"Cannot build write lineage for {self.sql}: "
+                f"unsupported INSERT branch {self.sql}"
+            )
+
+        row = insert.expression
+        if not isinstance(row, exp.Tuple):
+            raise SqlglotError(
+                f"Cannot build write lineage for {self.sql}: "
+                "INSERT branch must have a VALUES row"
+            )
+
+        return self._trace_values(columns, row.expressions, sources, merge)
+
+    def _trace_values(
+        self,
+        columns: list[str],
+        values: t.Sequence[exp.Expr],
+        sources: list[exp.Expr],
+        statement: exp.Expr,
+    ) -> dict[str, Node]:
+        if len(columns) != len(values):
+            raise SqlglotError(
+                f"Column count mismatch in {self.sql}: "
+                f"{len(columns)} target columns but {len(values)} source expressions"
+            )
+
+        select = exp.Select(expressions=[value.copy() for value in values])
+        select.set("from_", exp.From(this=sources[0].copy()))
+        for source in sources[1:]:
+            source = source.copy()
+            select.append(
+                "joins", source if isinstance(source, exp.Join) else exp.Join(this=source)
+            )
+
+        with_ = statement.args.get("with_")
+        if with_ is not None:
+            select.set("with_", with_.copy())
+
+        scope = self._build_scope(select)
+
+        result = {}
+        for index, name in enumerate(columns):
+            node = self._target_node(name, statement, values[index])
+            result[name] = node
+            self._to_node(index, scope, upstream=node)
+            self._emit(node)
+
+        return result
+
+    def _add_kept_columns(self, columns: dict[str, Node], target: exp.Table) -> None:
+        for name in self.schema.column_names(target, only_visible=True):
+            if name not in columns:
+                node = Node(
+                    name=name,
+                    source=target,
+                    expression=exp.column(name, table=target.alias_or_name or None),
+                    payload={"kind": "kept"},
+                )
+                columns[name] = node
+                self._emit(node)
+
+    def _target_node(self, name: str, statement: exp.Expr, value: exp.Expr) -> Node:
+        return Node(
+            name=name,
+            source=statement,
+            expression=exp.column(name),
+            payload={"kind": _value_kind(value)},
+        )
+
+    def _build_scope(self, query: exp.Query) -> Scope:
+        query = qualify.qualify(
+            query,
+            dialect=self.dialect,
+            schema=self.schema,
+            **{"validate_qualify_columns": False, "identify": False, **self.qualify_kwargs},  # type: ignore
+        )
+        scope = build_scope(query)
+        if not scope:
+            raise SqlglotError(
+                f"Cannot build write lineage, could not scope {query.sql(dialect=self.dialect)}"
+            )
+        return scope
+
+    def _to_node(self, index: int, scope: Scope, upstream: Node) -> None:
+        if isinstance(scope.expression, exp.SetOperation):
+            # to_node only creates a node for the set operation when there is no
+            # upstream; create it here so UNIONs stay visible in the graph
+            set_operation = Node(
+                name=type(scope.expression).__name__.upper(),
+                source=scope.expression,
+                expression=scope.expression,
+            )
+            upstream.downstream.append(set_operation)
+            self._emit(set_operation)
+            upstream = set_operation
+
+        to_node(
+            index,
+            scope=scope,
+            dialect=self.dialect,
+            upstream=upstream,
+            trim_selects=self.trim_selects,
+            schema=self.schema,
+            _cache=self.cache,
+            _scope_meta=self.scope_meta,
+            on_node=self.on_node,
+        )
+
+    def _emit(self, node: Node) -> None:
+        if self.on_node:
+            self.on_node(node)
+
+
+def _from_sources(from_: exp.From) -> list[exp.Expr]:
+    # In an UPDATE ... FROM, the parser hangs comma-joined and explicit joins off
+    # the first source, so detach them to rebuild a flat source list
+    sources = []
+    first = from_.this
+    nested = first.args.get("joins") if isinstance(first, (exp.Table, exp.Subquery)) else None
+    if nested:
+        first = first.copy()
+        first.args.pop("joins")
+        sources.append(first)
+        sources.extend(nested)
+    else:
+        sources.append(first)
+    sources.extend(from_.args.get("expressions") or [])
+    return sources
+
+
+def _value_kind(expression: exp.Expr) -> str:
+    expression = expression.unalias()
+    if (
+        isinstance(expression, exp.Var)
+        or (isinstance(expression, exp.Column) and not expression.table)
+    ) and expression.name.upper() == "DEFAULT":
+        return "default"
+    if expression.find(exp.Column, exp.Subquery, exp.Star):
+        return "source"
+    return "constant"
 
 
 def _pre_pivot_columns(pivot: exp.Pivot, scope: Scope, schema: Schema | None = None) -> list[str]:
