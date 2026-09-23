@@ -13,6 +13,10 @@ from sqlglot import Dialect, exp
 from sqlglot.helper import first, merge_ranges, while_changing
 from sqlglot.optimizer.annotate_types import TypeAnnotator
 from sqlglot.optimizer.scope import find_all_in_scope, walk_in_scope
+from sqlglot.optimizer.volatility import (
+    is_volatile,
+    normalize_function_volatility,
+)
 from sqlglot.schema import ensure_schema
 
 
@@ -46,6 +50,7 @@ def simplify(
     constant_propagation: bool = False,
     coalesce_simplification: bool = False,
     dialect: DialectType = None,
+    function_volatility: dict[str, str] | None = None,
 ):
     """
     Rewrite sqlglot AST to simplify expressions.
@@ -62,10 +67,12 @@ def simplify(
         coalesce_simplification: whether the simplify coalesce rule should be used.
             This rule tries to remove coalesce functions, which can be useful in certain analyses but
             can leave the query more verbose.
+        function_volatility: mapping of function names to "immutable", "stable" or "volatile",
+            used to avoid simplifying away or duplicating volatile function calls.
     Returns:
         sqlglot.Expr: simplified expression
     """
-    return Simplifier(dialect=dialect).simplify(
+    return Simplifier(dialect=dialect, function_volatility=function_volatility).simplify(
         expression,
         constant_propagation=constant_propagation,
         coalesce_simplification=coalesce_simplification,
@@ -562,13 +569,22 @@ def boolean_literal(condition: bool | exp.Predicate) -> exp.Boolean:
 
 
 class Simplifier:
-    def __init__(self, dialect: DialectType = None, annotate_new_expressions: bool = True):
+    def __init__(
+        self,
+        dialect: DialectType = None,
+        annotate_new_expressions: bool = True,
+        function_volatility: dict[str, str] | None = None,
+    ):
         self.dialect = Dialect.get_or_raise(dialect)
         self.annotate_new_expressions = annotate_new_expressions
+        self.function_volatility = normalize_function_volatility(function_volatility)
 
         self._annotator: TypeAnnotator = TypeAnnotator(
             schema=ensure_schema(None, dialect=self.dialect), overwrite_types=False
         )
+
+    def _is_volatile(self, expression: exp.Expr) -> bool:
+        return is_volatile(expression, self.function_volatility)
 
     # Value ranges for byte-sized signed/unsigned integers
     TINYINT_MIN: t.ClassVar = -128
@@ -612,7 +628,6 @@ class Simplifier:
         exp.GTE: exp.LTE,
     }
 
-    NONDETERMINISTIC: t.ClassVar = (exp.Rand, exp.Randn)
     AND_OR: t.ClassVar = (exp.And, exp.Or)
 
     INVERSE_DATE_OPS: t.ClassVar[dict[type[exp.Expr], type[exp.Expr]]] = {
@@ -807,6 +822,10 @@ class Simplifier:
         This is done because comparison simplification is only done on lt/lte/gt/gte.
         """
         if isinstance(expression, exp.Between):
+            # The rewrite duplicates the operand, which is unsafe for volatile calls
+            if self._is_volatile(expression.this):
+                return expression
+
             negate = isinstance(expression.parent, exp.Not)
 
             expression = exp.and_(
@@ -953,9 +972,7 @@ class Simplifier:
             rargs = {rl, rr}
 
             matching = largs & rargs
-            columns = {
-                m for m in matching if not _is_constant(m) and not m.find(*self.NONDETERMINISTIC)
-            }
+            columns = {m for m in matching if not _is_constant(m) and not self._is_volatile(m)}
 
             if matching and columns:
                 try:
@@ -1023,7 +1040,7 @@ class Simplifier:
         if isinstance(expression, self.AND_OR) and (root or not expression.same_parent):
             ops = set(expression.flatten())
             for op in ops:
-                if isinstance(op, exp.Not) and op.this in ops:
+                if isinstance(op, exp.Not) and op.this in ops and not self._is_volatile(op.this):
                     if expression.meta_get("nonnull") is True:
                         return exp.false() if isinstance(expression, exp.And) else exp.true()
 
@@ -1043,10 +1060,14 @@ class Simplifier:
                 result_func = exp.xor
                 # Do not deduplicate XOR as A XOR A != A if A == True
                 deduped = None
-                arr = tuple((gen(e), e) for e in flattened)
+                arr = tuple(((gen(e), 0), e) for e in flattened)
             else:
                 result_func = exp.and_ if isinstance(expression, exp.And) else exp.or_
-                deduped = {gen(e): e for e in flattened}
+                # Volatile calls can return a different value on every evaluation, so
+                # duplicates of them must be preserved instead of deduplicated
+                deduped = {}
+                for i, e in enumerate(flattened):
+                    deduped[(gen(e), i if self._is_volatile(e) else -1)] = e
                 arr = tuple(deduped.items())
 
             # check if the operands are already sorted, if not sort them
@@ -1079,6 +1100,11 @@ class Simplifier:
             (A OR B) AND (A OR NOT B) -> A (only for non-NULL B)
         """
         if isinstance(expression, self.AND_OR) and (root or not expression.same_parent):
+            # Absorption and elimination remove duplicate operands, which is unsafe for
+            # volatile calls since each evaluation can produce a different value
+            if any(self._is_volatile(op) for op in expression.flatten()):
+                return expression
+
             kind = exp.Or if isinstance(expression, exp.And) else exp.And
 
             ops = tuple(expression.flatten())
@@ -1362,6 +1388,11 @@ class Simplifier:
             if _is_nonnull_constant(arg):
                 break
         else:
+            return expression
+
+        # The rewrite below duplicates the COALESCE's first argument, which is unsafe
+        # for volatile calls since each evaluation can produce a different value
+        if self._is_volatile(coalesce.this):
             return expression
 
         coalesce.set("expressions", coalesce.expressions[:arg_index])

@@ -7,6 +7,7 @@ from sqlglot import alias, exp
 from sqlglot.optimizer.journal import Journal, record, revert
 from sqlglot.optimizer.qualify_columns import Resolver
 from sqlglot.optimizer.scope import Scope, find_all_in_scope, find_in_scope, traverse_scope
+from sqlglot.optimizer.volatility import is_volatile, normalize_function_volatility
 from sqlglot.schema import ensure_schema
 from sqlglot.errors import OptimizeError
 from sqlglot.helper import seq_get
@@ -74,6 +75,7 @@ def pushdown_projections(
     schema: dict[str, object] | Schema | None = None,
     dialect: DialectType = None,
     journal: Journal | None = None,
+    function_volatility: dict[str, str] | None = None,
 ) -> E:
     """
     Rewrite sqlglot AST to remove unused columns projections.
@@ -90,11 +92,15 @@ def pushdown_projections(
         schema: the database schema, used to expand `*` projections.
         dialect: the dialect of the expression.
         journal: if given, records every mutation so that `revert(journal)` undoes this rule.
+        function_volatility: mapping of function names to "immutable", "stable" or "volatile".
+            Unused projections containing volatile calls are kept, since removing them would
+            change how many times the calls are evaluated.
 
     Returns:
         The optimized expression.
     """
     schema = ensure_schema(schema, dialect=dialect)
+    function_volatility = normalize_function_volatility(function_volatility)
     source_column_alias_count: dict[Scope, int] = {}
 
     # Map of Scope to all columns being selected by outer queries.
@@ -211,6 +217,7 @@ def pushdown_projections(
                 schema,
                 alias_count,
                 pruning_journal if pruning_stack else journal,
+                function_volatility,
             )
 
         if widened and pruning_stack and scope.is_set_operation:
@@ -263,7 +270,9 @@ def pushdown_projections(
     return expression
 
 
-def _remove_unused_selections(scope, parent_selections, schema, alias_count, journal=None):
+def _remove_unused_selections(
+    scope, parent_selections, schema, alias_count, journal=None, function_volatility=None
+):
     expression = scope.expression
     output_refs = _output_column_refs(expression, scoped=False)
 
@@ -300,6 +309,11 @@ def _remove_unused_selections(scope, parent_selections, schema, alias_count, jou
             widened = widened or not referenced
         # keep projections containing these functions
         elif find_in_scope(selection, *SET_RETURNING_FUNCTIONS):
+            new_selections.append(selection)
+            widened = True
+        # keep projections with volatile calls: removing them would change how many
+        # times the calls are evaluated
+        elif is_volatile(selection, function_volatility):
             new_selections.append(selection)
             widened = True
         else:

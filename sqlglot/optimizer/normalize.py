@@ -8,11 +8,17 @@ from sqlglot.errors import OptimizeError
 from sqlglot.helper import while_changing
 from sqlglot.optimizer.scope import find_all_in_scope
 from sqlglot.optimizer.simplify import Simplifier, flatten
+from sqlglot.optimizer.volatility import is_volatile
 
 logger = logging.getLogger("sqlglot")
 
 
-def normalize(expression: exp.Expr, dnf: bool = False, max_distance: int = 128) -> exp.Expr:
+def normalize(
+    expression: exp.Expr,
+    dnf: bool = False,
+    max_distance: int = 128,
+    function_volatility: dict[str, str] | None = None,
+) -> exp.Expr:
     """
     Rewrite sqlglot AST into conjunctive normal form or disjunctive normal form.
 
@@ -26,14 +32,19 @@ def normalize(expression: exp.Expr, dnf: bool = False, max_distance: int = 128) 
         expression: expression to normalize
         dnf: rewrite in disjunctive normal form instead.
         max_distance (int): the maximal estimated distance from cnf/dnf to attempt conversion
+        function_volatility: mapping of function names to "immutable", "stable" or "volatile".
+            Connectors containing volatile calls are not normalized, since the distributive
+            law duplicates operands.
     Returns:
         sqlglot.Expr: normalized expression
     """
-    simplifier = Simplifier(annotate_new_expressions=False)
+    simplifier = Simplifier(annotate_new_expressions=False, function_volatility=function_volatility)
 
     for node in tuple(expression.walk(prune=lambda e: isinstance(e, exp.Connector))):
         if isinstance(node, exp.Connector):
             if normalized(node, dnf=dnf):
+                continue
+            if is_volatile(node, simplifier.function_volatility):
                 continue
             root = node is expression
             original = node.copy()

@@ -1,4 +1,5 @@
 import unittest
+import sqlite3
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
 from unittest.mock import patch
@@ -15,6 +16,12 @@ from sqlglot.optimizer.journal import record, revert
 from sqlglot.optimizer.normalize import normalization_distance
 from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.scope import build_scope, traverse_scope, walk_in_scope
+from sqlglot.optimizer.volatility import (
+    expression_volatility,
+    function_volatility,
+    is_volatile,
+    normalize_function_volatility,
+)
 from sqlglot.schema import MappingSchema
 from tests.helpers import (
     TPCDS_SCHEMA,
@@ -3884,3 +3891,180 @@ SELECT :with_,WITH :expressions,CTE :this,UNION :this,SELECT :expressions,1,:exp
         schema_ext = {"t": {"_col": "INT"}}
         query = optimizer.qualify.qualify(parse_one(sql), schema=schema_ext)
         optimizer.annotate_types.annotate_types(query, schema=schema_ext)
+
+
+class TestFunctionVolatility(unittest.TestCase):
+    """Tests for the per-call function volatility config of the optimizer."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.con = sqlite3.connect(":memory:")
+        cls.con.execute("CREATE TABLE t (a INTEGER, b INTEGER)")
+        cls.con.executemany("INSERT INTO t VALUES (?, ?)", [(1, 1), (2, 2), (2, 2), (3, 3), (3, 3)])
+        cls.con.execute("CREATE TABLE t2 (counter INTEGER)")
+        cls.con.executemany("INSERT INTO t2 VALUES (?)", [(1,), (2,)])
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.con.close()
+
+    def setUp(self):
+        self.calls = 0
+
+        def counter(_ignored=None):
+            self.calls += 1
+            return self.calls
+
+        # MD5 parses to a known expression (immutable by default), COUNTER to an anonymous
+        # one (conservatively volatile by default); both increment a counter on every call
+        self.con.create_function("md5", 1, counter)
+        self.con.create_function("counter", 0, counter)
+
+    def run_sql(self, sql):
+        self.calls = 0
+        rows = self.con.execute(sql).fetchall()
+        return rows, self.calls
+
+    def optimize_sql(self, sql, **kwargs):
+        return optimizer.optimize(sql, dialect="sqlite", **kwargs).sql("sqlite")
+
+    def test_volatile_not_deduplicated(self):
+        sql = "SELECT a FROM t WHERE md5(a) > 0 AND md5(a) > 0"
+        expected_rows, expected_calls = self.run_sql(sql)
+
+        rows, calls = self.run_sql(self.optimize_sql(sql, function_volatility={"md5": "volatile"}))
+        self.assertEqual(rows, expected_rows)
+        self.assertEqual(calls, expected_calls)
+
+        # stable functions may be shared within a statement, immutable ones always
+        for level in ("stable", "immutable"):
+            rows, calls = self.run_sql(self.optimize_sql(sql, function_volatility={"md5": level}))
+            self.assertEqual(rows, expected_rows)
+            self.assertEqual(calls, expected_calls // 2)
+
+    def test_unknown_functions_default_to_volatile(self):
+        sql = "SELECT a FROM t WHERE counter() > 0 AND counter() > 0"
+        expected_rows, expected_calls = self.run_sql(sql)
+
+        rows, calls = self.run_sql(self.optimize_sql(sql))
+        self.assertEqual(rows, expected_rows)
+        self.assertEqual(calls, expected_calls)
+
+        # unless the caller declares them immutable
+        rows, calls = self.run_sql(
+            self.optimize_sql(sql, function_volatility={"counter": "immutable"})
+        )
+        self.assertEqual(calls, expected_calls // 2)
+
+    def test_volatile_not_merged(self):
+        sql = "SELECT q.c AS c1, q.c AS c2 FROM (SELECT md5(a) AS c FROM t) q"
+        expected_rows, expected_calls = self.run_sql(sql)
+
+        optimized = optimizer.optimize(
+            sql, dialect="sqlite", function_volatility={"md5": "volatile"}
+        )
+        rows, calls = self.run_sql(optimized.sql("sqlite"))
+        self.assertEqual(rows, expected_rows)
+        self.assertEqual(calls, expected_calls)
+        # the volatile call stays in the subquery instead of being copied per reference
+        self.assertEqual(len(list(optimized.find_all(exp.MD5))), 1)
+
+        optimized = optimizer.optimize(
+            sql, dialect="sqlite", function_volatility={"md5": "immutable"}
+        )
+        self.assertEqual(len(list(optimized.find_all(exp.MD5))), 2)
+
+    def test_volatile_not_pushed_down(self):
+        sql = "SELECT q.a FROM (SELECT DISTINCT a, b FROM t) q WHERE md5(q.b) > 0"
+        expected_rows, expected_calls = self.run_sql(sql)
+
+        rows, calls = self.run_sql(self.optimize_sql(sql, function_volatility={"md5": "volatile"}))
+        self.assertEqual(rows, expected_rows)
+        self.assertEqual(calls, expected_calls)
+
+        # immutable/stable predicates are pushed into the derived table, where the call
+        # also runs on the duplicate rows later collapsed by DISTINCT
+        for level in ("stable", "immutable"):
+            rows, calls = self.run_sql(self.optimize_sql(sql, function_volatility={"md5": level}))
+            self.assertEqual(rows, expected_rows)
+            self.assertEqual(calls, 5)
+
+    def test_same_named_column_is_not_misidentified(self):
+        sql = "SELECT counter FROM t2 WHERE counter = 1 AND counter = 1"
+        expected_rows, _ = self.run_sql(sql)
+
+        # a column named like a configured function is still deterministic
+        optimized = self.optimize_sql(sql, function_volatility={"counter": "volatile"})
+        self.assertEqual(
+            optimized,
+            'SELECT "t2"."counter" AS "counter" FROM "t2" AS "t2" WHERE "t2"."counter" = 1',
+        )
+        rows, _ = self.run_sql(optimized)
+        self.assertEqual(rows, expected_rows)
+
+    def test_deterministic_expressions_still_simplify(self):
+        self.assertEqual(
+            self.optimize_sql("SELECT a FROM t WHERE a = 1 AND a = 1 AND 2 + 3 = 5"),
+            'SELECT "t"."a" AS "a" FROM "t" AS "t" WHERE "t"."a" = 1',
+        )
+
+    def test_volatile_not_removed_or_copied(self):
+        # unused CTEs with volatile calls are kept
+        sql = "WITH c AS (SELECT md5(a) AS x FROM t) SELECT 1 AS y"
+        self.assertIn("WITH", self.optimize_sql(sql, function_volatility={"md5": "volatile"}))
+        self.assertNotIn("WITH", self.optimize_sql(sql, function_volatility={"md5": "immutable"}))
+
+        # unused projections with volatile calls are kept
+        sql = "SELECT q.a FROM (SELECT a, md5(b) AS m FROM t) q"
+        optimized = optimizer.optimize(
+            sql, dialect="sqlite", function_volatility={"md5": "volatile"}
+        )
+        self.assertEqual(len(list(optimized.find_all(exp.MD5))), 1)
+        optimized = optimizer.optimize(
+            sql, dialect="sqlite", function_volatility={"md5": "immutable"}
+        )
+        self.assertEqual(len(list(optimized.find_all(exp.MD5))), 0)
+
+        # BETWEEN is not expanded into two comparisons, which would double the calls
+        sql = "SELECT a FROM t WHERE md5(a) BETWEEN 1 AND 2"
+        self.assertIn("BETWEEN", self.optimize_sql(sql, function_volatility={"md5": "volatile"}))
+        self.assertNotIn(
+            "BETWEEN", self.optimize_sql(sql, function_volatility={"md5": "immutable"})
+        )
+
+    def test_function_volatility_resolution(self):
+        def func(sql):
+            expression = parse_one(f"SELECT {sql}").expressions[0]
+            return expression.expression if isinstance(expression, exp.Dot) else expression
+
+        # unknown functions are conservatively volatile, known ones immutable
+        self.assertEqual(function_volatility(func("foo()")), "volatile")
+        self.assertEqual(function_volatility(func("upper('a')")), "immutable")
+        self.assertEqual(function_volatility(func("rand()")), "volatile")
+
+        config = normalize_function_volatility({"Foo": "STABLE", "s.bar": "immutable"})
+        self.assertEqual(function_volatility(func("foo()"), config), "stable")
+        self.assertEqual(function_volatility(func("FOO()"), config), "stable")
+
+        # qualified calls only match qualified config keys and vice versa
+        self.assertEqual(function_volatility(func("s.bar()"), config), "immutable")
+        self.assertEqual(function_volatility(func("bar()"), config), "volatile")
+        self.assertEqual(function_volatility(func("other.bar()"), config), "volatile")
+
+        with self.assertRaises(ValueError):
+            normalize_function_volatility({"f": "sometimes"})
+
+    def test_volatility_propagates_through_expressions(self):
+        config = normalize_function_volatility({"md5": "volatile"})
+
+        self.assertTrue(
+            is_volatile(parse_one("SELECT * FROM (SELECT md5(a) AS c FROM t) q"), config)
+        )
+        self.assertTrue(
+            is_volatile(parse_one("WITH c AS (SELECT md5(a) AS x FROM t) SELECT * FROM c"), config)
+        )
+        self.assertEqual(expression_volatility(parse_one("SELECT md5(a)"), config), "volatile")
+        self.assertEqual(expression_volatility(parse_one("SELECT 1 + 1"), config), "immutable")
+
+        # a column named like a configured function is not a function call
+        self.assertFalse(is_volatile(parse_one("SELECT md5 FROM t"), config))

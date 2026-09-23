@@ -7,6 +7,7 @@ from collections import defaultdict
 from sqlglot import expressions as exp
 from sqlglot.helper import find_new_name, seq_get
 from sqlglot.optimizer.scope import Scope, traverse_scope
+from sqlglot.optimizer.volatility import is_volatile, normalize_function_volatility
 
 if t.TYPE_CHECKING:
     from sqlglot._typing import E
@@ -14,7 +15,11 @@ if t.TYPE_CHECKING:
     FromOrJoin = t.Union[exp.From, exp.Join]
 
 
-def merge_subqueries(expression: E, leave_tables_isolated: bool = False) -> E:
+def merge_subqueries(
+    expression: E,
+    leave_tables_isolated: bool = False,
+    function_volatility: dict[str, str] | None = None,
+) -> E:
     """
     Rewrite sqlglot AST to merge derived tables into the outer query.
 
@@ -37,19 +42,28 @@ def merge_subqueries(expression: E, leave_tables_isolated: bool = False) -> E:
     Args:
         expression (sqlglot.Expr): expression to optimize
         leave_tables_isolated (bool):
+        function_volatility (dict[str, str] | None): mapping of function names to "immutable",
+            "stable" or "volatile". Queries projecting volatile calls are not merged, since
+            merging can duplicate them or move them onto a different set of rows.
     Returns:
         sqlglot.Expr: optimized expression
     """
+    volatility = normalize_function_volatility(function_volatility)
+
     # Shared across both passes so the scope tree is only built once, as long as merge_ctes
     # doesn't mutate the AST; if it does, the scopes it was given are no longer valid, so the
     # scope tree needs to be rebuilt before merge_derived_tables runs.
     scopes = traverse_scope(expression)
-    expression, merged_ctes = merge_ctes(expression, leave_tables_isolated, scopes=scopes)
+    expression, merged_ctes = merge_ctes(
+        expression, leave_tables_isolated, scopes=scopes, function_volatility=volatility
+    )
 
     if merged_ctes:
         scopes = traverse_scope(expression)
 
-    expression = merge_derived_tables(expression, leave_tables_isolated, scopes=scopes)
+    expression = merge_derived_tables(
+        expression, leave_tables_isolated, scopes=scopes, function_volatility=volatility
+    )
     return expression
 
 
@@ -79,6 +93,7 @@ def merge_ctes(
     expression: E,
     leave_tables_isolated: bool = False,
     scopes: list[Scope] | None = None,
+    function_volatility: dict[str, str] | None = None,
 ) -> tuple[E, bool]:
     # All places where we select from CTEs.
     # We key on the CTE scope so we can detect CTES that are selected from multiple times.
@@ -100,7 +115,9 @@ def merge_ctes(
         from_or_join = table.find_ancestor(exp.From, exp.Join)
         if not isinstance(from_or_join, (exp.From, exp.Join)):
             continue
-        if _mergeable(outer_scope, inner_scope, leave_tables_isolated, from_or_join):
+        if _mergeable(
+            outer_scope, inner_scope, leave_tables_isolated, from_or_join, function_volatility
+        ):
             alias = table.alias_or_name
             _rename_inner_sources(outer_scope, inner_scope, alias)
             _merge_from(outer_scope, inner_scope, table, alias)
@@ -119,6 +136,7 @@ def merge_derived_tables(
     expression: E,
     leave_tables_isolated: bool = False,
     scopes: list[Scope] | None = None,
+    function_volatility: dict[str, str] | None = None,
 ) -> E:
     for outer_scope in traverse_scope(expression) if scopes is None else scopes:
         for subquery in outer_scope.derived_tables:
@@ -129,7 +147,9 @@ def merge_derived_tables(
             inner_scope = outer_scope.sources[alias]
             if not isinstance(inner_scope, Scope):
                 continue
-            if _mergeable(outer_scope, inner_scope, leave_tables_isolated, from_or_join):
+            if _mergeable(
+                outer_scope, inner_scope, leave_tables_isolated, from_or_join, function_volatility
+            ):
                 _rename_inner_sources(outer_scope, inner_scope, alias)
                 _merge_from(outer_scope, inner_scope, subquery, alias)
                 _merge_expressions(outer_scope, inner_scope, alias)
@@ -147,6 +167,7 @@ def _mergeable(
     inner_scope: Scope,
     leave_tables_isolated: bool,
     from_or_join: FromOrJoin,
+    function_volatility: dict[str, str] | None = None,
 ) -> bool:
     """
     Return True if `inner_select` can be merged into outer query.
@@ -302,6 +323,9 @@ def _mergeable(
         projections[name] = s
         if s.unalias().is_number:
             number_literal_aliases.add(name)
+        # Merging duplicates or reorders volatile calls, changing how often they run
+        if is_volatile(s, function_volatility):
+            return False
         for node in s.walk():
             if isinstance(node, (exp.AggFunc, exp.Select, *exp.SET_RETURNING_FUNCTIONS)):
                 return False

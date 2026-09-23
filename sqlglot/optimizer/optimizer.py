@@ -19,6 +19,7 @@ from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.qualify_columns import quote_identifiers
 from sqlglot.optimizer.simplify import simplify
 from sqlglot.optimizer.unnest_subqueries import unnest_subqueries
+from sqlglot.optimizer.volatility import normalize_function_volatility
 from sqlglot.schema import ensure_schema
 
 
@@ -63,6 +64,7 @@ def optimize(
     dialect: DialectType = None,
     rules: Sequence[OptimizerFn] = RULES,
     sql: str | None = None,
+    function_volatility: dict[str, str] | None = None,
     **kwargs: object,
 ) -> exp.Expr:
     """
@@ -85,6 +87,12 @@ def optimize(
             Do not remove `qualify` from the sequence of rules unless you know what you're doing!
         sql: Original SQL string for error highlighting. If not provided, errors will not include
             highlighting. Requires that the expression has position metadata from parsing.
+        function_volatility: mapping of function names to their volatility level, one of
+            "immutable", "stable" or "volatile". Names can be schema-qualified (e.g.
+            "my_schema.my_func") and are matched case-insensitively. Rules that delete,
+            duplicate or move expressions use this to avoid changing how many times a
+            volatile or stable function is called. Functions sqlglot doesn't know are
+            conservatively treated as volatile.
         **kwargs: If a rule has a keyword argument with a same name in **kwargs, it will be passed in.
 
     Returns:
@@ -97,6 +105,7 @@ def optimize(
         "schema": schema,
         "dialect": dialect,
         "sql": sql,
+        "function_volatility": normalize_function_volatility(function_volatility),
         "isolate_tables": True,  # needed for other optimizations to perform well
         "quote_identifiers": False,
         **kwargs,

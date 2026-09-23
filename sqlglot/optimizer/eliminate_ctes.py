@@ -4,13 +4,18 @@ import typing as t
 
 from sqlglot.optimizer.journal import Journal, record
 from sqlglot.optimizer.scope import Scope, build_scope
+from sqlglot.optimizer.volatility import is_volatile, normalize_function_volatility
 
 
 if t.TYPE_CHECKING:
     from sqlglot._typing import E
 
 
-def eliminate_ctes(expression: E, journal: Journal | None = None) -> E:
+def eliminate_ctes(
+    expression: E,
+    journal: Journal | None = None,
+    function_volatility: dict[str, str] | None = None,
+) -> E:
     """
     Remove unused CTEs from an expression.
 
@@ -23,10 +28,15 @@ def eliminate_ctes(expression: E, journal: Journal | None = None) -> E:
 
     Args:
         expression (sqlglot.Expr): expression to optimize
+        journal (sqlglot.optimizer.journal.Journal | None): optional journal of mutations
+        function_volatility (dict[str, str] | None): mapping of function names to "immutable",
+            "stable" or "volatile". CTEs containing volatile calls are never removed, since
+            removing them would delete the calls' side effects.
     Returns:
         sqlglot.Expr: optimized expression
     """
     root = build_scope(expression)
+    function_volatility = normalize_function_volatility(function_volatility)
 
     if root:
         ref_count = root.ref_count()
@@ -36,6 +46,11 @@ def eliminate_ctes(expression: E, journal: Journal | None = None) -> E:
             if scope.is_cte:
                 count = ref_count[id(scope)]
                 if count <= 0:
+                    # An unreferenced CTE with volatile calls can't be removed: each call
+                    # may produce a different value or have side effects
+                    if is_volatile(scope.expression, function_volatility):
+                        continue
+
                     cte_node = scope.expression.parent
                     if not cte_node:
                         continue

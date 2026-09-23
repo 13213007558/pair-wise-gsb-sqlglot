@@ -7,6 +7,7 @@ from sqlglot import exp
 from sqlglot.optimizer.normalize import normalized
 from sqlglot.optimizer.scope import build_scope, find_in_scope, Scope
 from sqlglot.optimizer.simplify import simplify
+from sqlglot.optimizer.volatility import is_volatile, normalize_function_volatility
 from sqlglot import Dialect
 
 if t.TYPE_CHECKING:
@@ -16,7 +17,11 @@ if t.TYPE_CHECKING:
     Sources = Mapping[str, tuple[exp.Selectable, t.Union[exp.Table, Scope]]]
 
 
-def pushdown_predicates(expression: E, dialect: DialectType = None) -> E:
+def pushdown_predicates(
+    expression: E,
+    dialect: DialectType = None,
+    function_volatility: dict[str, str] | None = None,
+) -> E:
     """
     Rewrite sqlglot AST to pushdown predicates in FROMS and JOINS
 
@@ -29,6 +34,10 @@ def pushdown_predicates(expression: E, dialect: DialectType = None) -> E:
 
     Args:
         expression (sqlglot.Expr): expression to optimize
+        dialect (sqlglot.DialectType): the dialect of the expression
+        function_volatility (dict[str, str] | None): mapping of function names to "immutable",
+            "stable" or "volatile". Predicates containing volatile calls are not pushed down,
+            since pushdown can move or duplicate them.
     Returns:
         sqlglot.Expr: optimized expression
     """
@@ -39,6 +48,7 @@ def pushdown_predicates(expression: E, dialect: DialectType = None) -> E:
 
     dialect = Dialect.get_or_raise(dialect)
     unnest_requires_cross_join = isinstance(dialect, (Athena, Presto))
+    function_volatility = normalize_function_volatility(function_volatility)
 
     if root:
         scope_ref_count = root.ref_count()
@@ -77,7 +87,14 @@ def pushdown_predicates(expression: E, dialect: DialectType = None) -> E:
                 selected_sources = reachable
 
                 if pushdown_allowed:
-                    pushdown(where.this, selected_sources, scope_ref_count, dialect, join_index)
+                    pushdown(
+                        where.this,
+                        selected_sources,
+                        scope_ref_count,
+                        dialect,
+                        join_index,
+                        function_volatility=function_volatility,
+                    )
 
             # joins should only pushdown into itself, not to other joins
             # so we limit the selected sources to only itself
@@ -93,6 +110,7 @@ def pushdown_predicates(expression: E, dialect: DialectType = None) -> E:
                         {name: scope.selected_sources[name]},
                         scope_ref_count,
                         dialect,
+                        function_volatility=function_volatility,
                     )
 
     return expression
@@ -104,11 +122,14 @@ def pushdown(
     scope_ref_count: Mapping[int, int],
     dialect: DialectType,
     join_index: Mapping[str, int] | None = None,
+    function_volatility: dict[str, str] | None = None,
 ) -> None:
     if not condition:
         return
 
-    condition = condition.replace(simplify(condition, dialect=dialect))
+    condition = condition.replace(
+        simplify(condition, dialect=dialect, function_volatility=function_volatility)
+    )
     cnf_like = normalized(condition) or not normalized(condition, dnf=True)
 
     predicates = list(
@@ -116,6 +137,9 @@ def pushdown(
         if isinstance(condition, exp.And if cnf_like else exp.Or)
         else [condition]
     )
+
+    # Volatile calls can't be moved into another query or copied onto more rows
+    predicates = [p for p in predicates if not is_volatile(p, function_volatility)]
 
     if cnf_like:
         pushdown_cnf(predicates, sources, scope_ref_count, join_index=join_index)
