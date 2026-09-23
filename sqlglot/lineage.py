@@ -32,6 +32,10 @@ class Node:
     # Caller-injected per-node data, populated via the `on_node` hook on lineage()
     payload: dict[str, t.Any] = field(default_factory=dict)
 
+    # The kind of value a DML write-lineage node represents, one of WriteKind.
+    # Empty for nodes built by select-lineage
+    kind: str = ""
+
     def walk(self) -> Iterator[Node]:
         visited: set[int] = set()
         queue = [self]
@@ -76,6 +80,83 @@ class Node:
             for d in node.downstream:
                 edges.append({"from": node_id, "to": id(d)})
         return GraphHTML(nodes, edges, **opts)
+
+
+class WriteKind:
+    """The origin of the value written to a target column by a DML statement."""
+
+    # Derived from source tables / expressions; its inputs are traced downstream
+    EXPRESSION = "expression"
+
+    # Read from a row of an INSERT ... VALUES statement; rows are downstream
+    VALUES = "values"
+
+    # A literal constant
+    CONSTANT = "constant"
+
+    # The DEFAULT keyword (or INSERT ... DEFAULT VALUES)
+    DEFAULT = "default"
+
+    # The target column is not written, so its pre-update value is kept
+    RETAINED = "retained"
+
+
+@dataclass
+class WriteBranch:
+    """A single write action of a DML statement.
+
+    Attributes:
+        action: The action performed by this branch: "INSERT", "UPDATE" or "DELETE".
+        columns: Mapping of target column name to the lineage Node of the written value.
+        condition: The branch's own control condition (e.g. a MERGE WHEN clause's
+            condition or an UPDATE's WHERE clause). It is a control dependency only:
+            it never appears in the value lineage of columns.
+        matched: For MERGE branches, whether this is a MATCHED or NOT MATCHED branch.
+            None for plain INSERT / UPDATE statements.
+        source: For MERGE branches, whether this is a NOT MATCHED BY SOURCE branch.
+    """
+
+    action: str
+    columns: dict[str, Node] = field(default_factory=dict)
+    condition: exp.Expr | None = None
+    matched: bool | None = None
+    source: bool = False
+
+
+@dataclass
+class DMLLineage:
+    """The write lineage of an INSERT, UPDATE or MERGE statement.
+
+    Attributes:
+        target: The name of the table being written to.
+        branches: The statement's write actions. Plain INSERT / UPDATE statements have
+            exactly one branch; MERGE has one per WHEN clause, in order.
+        on: The MERGE statement's ON condition, a control dependency shared by all
+            branches. None for other statements.
+    """
+
+    target: str
+    branches: list[WriteBranch] = field(default_factory=list)
+    on: exp.Expr | None = None
+
+    @property
+    def columns(self) -> dict[str, Node]:
+        """All written target columns, merged across branches (first branch wins)."""
+        merged: dict[str, Node] = {}
+        for branch in self.branches:
+            for name, node in branch.columns.items():
+                merged.setdefault(name, node)
+        return merged
+
+    def walk(self) -> Iterator[Node]:
+        """Yield every node of every branch's column lineage graph."""
+        seen: set[int] = set()
+        for branch in self.branches:
+            for root in branch.columns.values():
+                for node in root.walk():
+                    if id(node) not in seen:
+                        seen.add(id(node))
+                        yield node
 
 
 @t.overload
@@ -191,6 +272,74 @@ def lineage(
         )
 
     return result
+
+
+def dml_lineage(
+    sql: str | exp.Expr,
+    schema: dict | Schema | None = None,
+    sources: Mapping[str, str | exp.Query] | None = None,
+    dialect: DialectType = None,
+    copy: bool = True,
+    on_node: t.Callable[[Node], None] | None = None,
+    **kwargs,
+) -> DMLLineage:
+    """Build the write-lineage graph of an INSERT, UPDATE or MERGE statement.
+
+    For every column of the target table that the statement writes, this traces
+    which sources the written value comes from. VALUES rows, constants, DEFAULT,
+    retained pre-update values and expressions read from source tables are
+    distinguished through Node.kind (see WriteKind).
+
+    UPDATE assignments read the pre-update row: a SET clause never sources a later
+    SET clause. MERGE WHEN conditions are kept on their branch as control
+    dependencies and are not mixed into the column value sources.
+
+    Args:
+        sql: The SQL string or expression. Must be an INSERT, UPDATE or MERGE.
+        schema: The schema of tables. Required to resolve target columns when the
+            statement has no explicit column list, and to expand stars.
+        sources: A mapping of queries which will be used to continue building lineage.
+        dialect: The dialect of input SQL.
+        copy: Whether to copy the Expr arguments.
+        on_node: Optional callback invoked for every Node created during the walk.
+        **kwargs: Qualification optimizer kwargs.
+
+    Returns:
+        The DMLLineage of the statement.
+    """
+    expression = maybe_parse(sql, copy=copy, dialect=dialect)
+
+    if sources:
+        expression = exp.expand(
+            expression,
+            {
+                k: t.cast(exp.Query, maybe_parse(v, copy=copy, dialect=dialect))
+                for k, v in sources.items()
+            },
+            dialect=dialect,
+            copy=copy,
+        )
+
+    if not isinstance(expression, (exp.Insert, exp.Update, exp.Merge)):
+        raise SqlglotError(
+            f"Cannot build DML lineage for {type(expression).__name__}, "
+            "sql must be an INSERT, UPDATE or MERGE statement"
+        )
+
+    schema = ensure_schema(schema, dialect=dialect)
+    qualify_kwargs = {"validate_qualify_columns": False, "identify": False, **kwargs}
+    expression = qualify.qualify(
+        expression,
+        dialect=dialect,
+        schema=schema,
+        **qualify_kwargs,  # type: ignore
+    )
+
+    if isinstance(expression, exp.Insert):
+        return _insert_lineage(expression, schema, dialect, on_node, qualify_kwargs)
+    if isinstance(expression, exp.Update):
+        return _update_lineage(expression, schema, dialect, on_node, qualify_kwargs)
+    return _merge_lineage(t.cast(exp.Merge, expression), schema, dialect, on_node, qualify_kwargs)
 
 
 def to_node(
@@ -495,6 +644,478 @@ def to_node(
         on_node(node)
 
     return node
+
+
+def _is_default(expression: exp.Expr) -> bool:
+    """Whether an expression is the DEFAULT keyword in a DML value position."""
+    if isinstance(expression, exp.Var) and expression.name.upper() == "DEFAULT":
+        return True
+    return (
+        isinstance(expression, exp.Column)
+        and not expression.table
+        and expression.name.upper() == "DEFAULT"
+    )
+
+
+def _classify_value(expression: exp.Expr) -> str:
+    expression = expression.unalias()
+    if isinstance(expression, (exp.Literal, exp.Boolean, exp.Null)):
+        return WriteKind.CONSTANT
+    if _is_default(expression):
+        return WriteKind.DEFAULT
+    return WriteKind.EXPRESSION
+
+
+def _write_node(
+    target: str,
+    column: str,
+    source: exp.Expr,
+    kind: str,
+    expression: exp.Expr,
+    on_node: t.Callable[[Node], None] | None,
+) -> Node:
+    node = Node(name=f"{target}.{column}", expression=expression, source=source, kind=kind)
+    if on_node:
+        on_node(node)
+    return node
+
+
+def _resolve_target_columns(
+    table: exp.Table, explicit: list[str] | None, schema: Schema, context: str
+) -> list[str]:
+    if explicit:
+        return explicit
+
+    columns = list(schema.column_names(table))
+    if not columns:
+        raise SqlglotError(
+            f"Cannot determine the target columns of {context}: provide an explicit "
+            f"column list or include table '{table.name}' in the schema"
+        )
+    return columns
+
+
+def _extract_assignments(
+    expressions: list[exp.Expr], context: str, dialect: DialectType
+) -> list[tuple[str, exp.Expr]]:
+    assignments = []
+    for expression in expressions:
+        if not isinstance(expression, exp.EQ) or not isinstance(expression.this, exp.Column):
+            raise SqlglotError(
+                f"Unsupported SET expression in {context}: {expression.sql(dialect=dialect)}"
+            )
+        assignments.append((expression.this.name, expression.expression))
+    return assignments
+
+
+def _assignment_scope(
+    assignments: list[tuple[str, exp.Expr]],
+    from_relations: list[exp.Expr],
+    conditions: list[exp.Expr],
+    with_: exp.With | None,
+    schema: Schema,
+    dialect: DialectType,
+    qualify_kwargs: dict[str, t.Any],
+) -> Scope:
+    """Build the scope of a synthetic SELECT over the assignment's value expressions.
+
+    Projecting the SET / VALUES expressions from the target table and the statement's
+    source relations resolves them exactly like the DML statement would: unqualified
+    columns bind to the target table (reading the pre-update row) or to a source
+    relation, and conditions stay out of the projections.
+    """
+    synthetic = exp.Select(
+        expressions=[exp.alias_(rhs, column) for column, rhs in assignments],
+        from_=exp.From(this=from_relations[0].copy()),
+    )
+    if len(from_relations) > 1:
+        synthetic.set("joins", [exp.Join(this=relation.copy()) for relation in from_relations[1:]])
+    if conditions:
+        synthetic.set("where", exp.Where(this=exp.and_(*[c.copy() for c in conditions])))
+    if with_:
+        synthetic.set("with_", with_.copy())
+
+    qualified = qualify.qualify(
+        synthetic,
+        dialect=dialect,
+        schema=schema,
+        **qualify_kwargs,  # type: ignore
+    )
+    scope = build_scope(qualified)
+    if not scope:
+        raise SqlglotError("Cannot build lineage for the DML statement's value expressions")
+    return scope
+
+
+def _select_key(selects: list[exp.Expr], index: int) -> str | int:
+    """The key to trace a projection by: its alias, unless another projection
+    shares it, in which case fall back to its position."""
+    name = selects[index].alias_or_name
+    return name if name and sum(s.alias_or_name == name for s in selects) == 1 else index
+
+
+def _assignment_branch(
+    action: str,
+    table: exp.Table,
+    assignments: list[tuple[str, exp.Expr]],
+    from_relations: list[exp.Expr],
+    conditions: list[exp.Expr],
+    with_: exp.With | None,
+    condition: exp.Expr | None,
+    matched: bool | None,
+    source: bool,
+    statement: exp.Expr,
+    schema: Schema,
+    dialect: DialectType,
+    on_node: t.Callable[[Node], None] | None,
+    qualify_kwargs: dict[str, t.Any],
+) -> WriteBranch:
+    branch = WriteBranch(action=action, condition=condition, matched=matched, source=source)
+    table_name = table.name
+
+    classified = [(column, rhs, _classify_value(rhs)) for column, rhs in assignments]
+    traced = [(column, rhs) for column, rhs, kind in classified if kind == WriteKind.EXPRESSION]
+
+    graphs: list[Node] = []
+    if traced:
+        scope = _assignment_scope(
+            traced, from_relations, conditions, with_, schema, dialect, qualify_kwargs
+        )
+        selects = t.cast(exp.Select, scope.expression).selects
+        cache: dict[tuple, Node] = {}
+        scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] = {}
+        for index in range(len(traced)):
+            graphs.append(
+                to_node(
+                    _select_key(selects, index),
+                    scope,
+                    dialect,
+                    trim_selects=True,
+                    schema=schema,
+                    _cache=cache,
+                    _scope_meta=scope_meta,
+                    on_node=on_node,
+                )
+            )
+
+    graphs_iter = iter(graphs)
+    for column, rhs, kind in classified:
+        root = _write_node(table_name, column, statement, kind, rhs, on_node)
+        if kind == WriteKind.EXPRESSION:
+            root.downstream.append(next(graphs_iter))
+        branch.columns[column] = root
+
+    # Target columns that are not assigned keep their pre-update values
+    normalize = normalize_identifiers.normalize_identifiers
+    assigned = {normalize(column, dialect=dialect).name for column in branch.columns}
+    for column in schema.column_names(table):
+        if normalize(column, dialect=dialect).name not in assigned:
+            retained = Node(
+                name=f"{table_name}.{column}",
+                expression=exp.column(column, table=table.alias_or_name),
+                source=table,
+                kind=WriteKind.RETAINED,
+            )
+            if on_node:
+                on_node(retained)
+            branch.columns[column] = retained
+
+    return branch
+
+
+def _trace_free_expression(
+    expression: exp.Expr,
+    node: Node,
+    dialect: DialectType,
+    on_node: t.Callable[[Node], None] | None,
+) -> None:
+    """Trace the inputs of a value expression that has no enclosing query scope,
+    e.g. an entry of an INSERT ... VALUES row."""
+    for subquery in expression.find_all(exp.Subquery):
+        subquery_scope = build_scope(subquery)
+        if subquery_scope and isinstance(subquery_scope.expression, exp.Selectable):
+            for name in subquery_scope.expression.named_selects:
+                to_node(
+                    name,
+                    scope=subquery_scope,
+                    dialect=dialect,
+                    upstream=node,
+                    trim_selects=True,
+                    _cache={},
+                    _scope_meta={},
+                    on_node=on_node,
+                )
+
+    for column in find_all_in_scope(expression, exp.Column):
+        leaf = Node(
+            name=column.sql(comments=False),
+            source=exp.Placeholder(),
+            expression=exp.Placeholder(),
+        )
+        node.downstream.append(leaf)
+        if on_node:
+            on_node(leaf)
+
+
+def _insert_lineage(
+    insert: exp.Insert,
+    schema: Schema,
+    dialect: DialectType,
+    on_node: t.Callable[[Node], None] | None,
+    qualify_kwargs: dict[str, t.Any],
+) -> DMLLineage:
+    this = insert.this
+    if isinstance(this, exp.Schema) and isinstance(this.this, exp.Table):
+        table = this.this
+        explicit = [column.name for column in this.expressions]
+    elif isinstance(this, exp.Table):
+        table = this
+        explicit = None
+    else:
+        raise SqlglotError(f"Unsupported INSERT target: {this.sql(dialect=dialect)}")
+
+    context = f"INSERT into '{table.name}'"
+    columns = _resolve_target_columns(table, explicit, schema, context)
+    branch = WriteBranch(action="INSERT")
+    result = DMLLineage(target=table.name, branches=[branch])
+
+    if insert.args.get("by_name"):
+        raise SqlglotError(f"Cannot build lineage for {context}: BY NAME is not supported")
+
+    if insert.args.get("default"):
+        # INSERT ... DEFAULT VALUES
+        for column in columns:
+            branch.columns[column] = _write_node(
+                table.name, column, insert, WriteKind.DEFAULT, exp.var("DEFAULT"), on_node
+            )
+        return result
+
+    source = insert.expression
+    if isinstance(source, exp.Values):
+        rows = source.expressions
+        for row in rows:
+            if len(row.expressions) != len(columns):
+                raise SqlglotError(
+                    f"Column count mismatch in {context}: {len(columns)} target "
+                    f"column(s) but a VALUES row has {len(row.expressions)} value(s)"
+                )
+
+        for index, column in enumerate(columns):
+            root = _write_node(table.name, column, insert, WriteKind.VALUES, source, on_node)
+            for row in rows:
+                entry = row.expressions[index]
+                kind = _classify_value(entry)
+                value_node = Node(
+                    name=entry.sql(comments=False), expression=entry, source=row, kind=kind
+                )
+                if on_node:
+                    on_node(value_node)
+                if kind == WriteKind.EXPRESSION:
+                    _trace_free_expression(entry, value_node, dialect, on_node)
+                root.downstream.append(value_node)
+            branch.columns[column] = root
+    elif isinstance(source, exp.Query):
+        scope = build_scope(insert)
+        if not scope or not isinstance(scope.expression, exp.Selectable):
+            raise SqlglotError(f"Cannot build lineage for the source query of {context}")
+
+        selects = scope.expression.selects
+        if any(
+            isinstance(select, exp.Star) or (isinstance(select, exp.Column) and select.is_star)
+            for select in selects
+        ):
+            raise SqlglotError(
+                f"Cannot map the source columns of {context}: the source query "
+                "contains an unexpanded '*'; provide a schema"
+            )
+        if len(selects) != len(columns):
+            raise SqlglotError(
+                f"Column count mismatch in {context}: {len(columns)} target "
+                f"column(s) but the source query produces {len(selects)}"
+            )
+
+        cache: dict[tuple, Node] = {}
+        scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] = {}
+        for index, column in enumerate(columns):
+            projection = selects[index]
+            kind = _classify_value(projection)
+            root = _write_node(table.name, column, insert, kind, projection, on_node)
+            if kind == WriteKind.EXPRESSION:
+                root.downstream.append(
+                    to_node(
+                        _select_key(selects, index),
+                        scope,
+                        dialect,
+                        trim_selects=True,
+                        schema=schema,
+                        _cache=cache,
+                        _scope_meta=scope_meta,
+                        on_node=on_node,
+                    )
+                )
+            branch.columns[column] = root
+    else:
+        raise SqlglotError(
+            f"Unsupported INSERT source in {context}: "
+            f"{source.sql(dialect=dialect) if source else None}"
+        )
+
+    return result
+
+
+def _update_lineage(
+    update: exp.Update,
+    schema: Schema,
+    dialect: DialectType,
+    on_node: t.Callable[[Node], None] | None,
+    qualify_kwargs: dict[str, t.Any],
+) -> DMLLineage:
+    table = update.this
+    if not isinstance(table, exp.Table):
+        raise SqlglotError(f"Unsupported UPDATE target: {table.sql(dialect=dialect)}")
+
+    relations: list[exp.Expr] = []
+    from_ = update.args.get("from_")
+    if isinstance(from_, exp.From):
+        relations.append(from_.this)
+        relations.extend(from_.expressions)
+
+    where = update.args.get("where")
+    branch = _assignment_branch(
+        "UPDATE",
+        table,
+        _extract_assignments(update.expressions, f"UPDATE '{table.name}'", dialect),
+        [table, *relations],
+        [where.this] if where else [],
+        update.args.get("with_"),
+        condition=where.this if where else None,
+        matched=None,
+        source=False,
+        statement=update,
+        schema=schema,
+        dialect=dialect,
+        on_node=on_node,
+        qualify_kwargs=qualify_kwargs,
+    )
+    return DMLLineage(target=table.name, branches=[branch])
+
+
+def _merge_lineage(
+    merge: exp.Merge,
+    schema: Schema,
+    dialect: DialectType,
+    on_node: t.Callable[[Node], None] | None,
+    qualify_kwargs: dict[str, t.Any],
+) -> DMLLineage:
+    table = merge.this
+    if not isinstance(table, exp.Table):
+        raise SqlglotError(f"Unsupported MERGE target: {table.sql(dialect=dialect)}")
+
+    context = f"MERGE into '{table.name}'"
+    using = merge.args.get("using")
+    on = merge.args.get("on")
+    with_ = merge.args.get("with_")
+    result = DMLLineage(target=table.name, on=on)
+
+    for when in merge.args["whens"].expressions:
+        matched = when.args["matched"]
+        by_source = when.args.get("source") or False
+        condition = when.args.get("condition")
+        then = when.args["then"]
+        control = [c for c in (on, condition) if c is not None]
+
+        if isinstance(then, exp.Update):
+            branch = _assignment_branch(
+                "UPDATE",
+                table,
+                _extract_assignments(then.expressions, context, dialect),
+                [table, *([using] if isinstance(using, exp.Expr) else [])],
+                control,
+                with_,
+                condition=condition,
+                matched=matched,
+                source=by_source,
+                statement=then,
+                schema=schema,
+                dialect=dialect,
+                on_node=on_node,
+                qualify_kwargs=qualify_kwargs,
+            )
+        elif isinstance(then, exp.Insert):
+            branch = WriteBranch(
+                action="INSERT", condition=condition, matched=matched, source=by_source
+            )
+            columns_arg = then.this
+            explicit = (
+                [column.name for column in columns_arg.expressions]
+                if isinstance(columns_arg, exp.Tuple)
+                else None
+            )
+            columns = _resolve_target_columns(table, explicit, schema, context)
+            values = then.expression
+            if not isinstance(values, exp.Tuple) or len(values.expressions) != len(columns):
+                count = len(values.expressions) if isinstance(values, exp.Tuple) else 0
+                raise SqlglotError(
+                    f"Column count mismatch in {context}: {len(columns)} target "
+                    f"column(s) but the INSERT clause has {count} value(s)"
+                )
+
+            classified = [
+                (column, value, _classify_value(value))
+                for column, value in zip(columns, values.expressions)
+            ]
+            traced = [
+                (column, value)
+                for column, value, kind in classified
+                if kind == WriteKind.EXPRESSION
+            ]
+
+            graphs: list[Node] = []
+            if traced:
+                if not isinstance(using, exp.Expr):
+                    raise SqlglotError(
+                        f"Cannot trace the INSERT values of {context} without a USING source"
+                    )
+                scope = _assignment_scope(
+                    traced, [using], [], with_, schema, dialect, qualify_kwargs
+                )
+                merge_selects = t.cast(exp.Select, scope.expression).selects
+                cache: dict[tuple, Node] = {}
+                scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] = {}
+                for index in range(len(traced)):
+                    graphs.append(
+                        to_node(
+                            _select_key(merge_selects, index),
+                            scope,
+                            dialect,
+                            trim_selects=True,
+                            schema=schema,
+                            _cache=cache,
+                            _scope_meta=scope_meta,
+                            on_node=on_node,
+                        )
+                    )
+
+            graphs_iter = iter(graphs)
+            for column, value, kind in classified:
+                root = _write_node(table.name, column, then, kind, value, on_node)
+                if kind == WriteKind.EXPRESSION:
+                    root.downstream.append(next(graphs_iter))
+                branch.columns[column] = root
+        elif isinstance(then, exp.Delete) or (
+            isinstance(then, exp.Var) and then.name.upper() == "DELETE"
+        ):
+            branch = WriteBranch(
+                action="DELETE", condition=condition, matched=matched, source=by_source
+            )
+        else:
+            raise SqlglotError(
+                f"Unsupported MERGE action in {context}: {then.sql(dialect=dialect)}"
+            )
+
+        result.branches.append(branch)
+
+    return result
 
 
 def _pre_pivot_columns(pivot: exp.Pivot, scope: Scope, schema: Schema | None = None) -> list[str]:

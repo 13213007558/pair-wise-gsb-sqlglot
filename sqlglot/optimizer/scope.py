@@ -445,6 +445,11 @@ class Scope:
         if self._references is None:
             self._references = []
 
+            if isinstance(self.expression, exp.Table):
+                # A Table-rooted scope (e.g. a DML statement's FROM / USING relation)
+                # selects from the root table itself
+                self._references.append((self.expression.alias_or_name, self.expression))
+
             for table in self.tables:
                 self._references.append((table.alias_or_name, table))
             for _expr in itertools.chain(self.derived_tables, self.udtfs):

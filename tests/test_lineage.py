@@ -3,8 +3,14 @@ from __future__ import annotations
 import unittest
 
 import sqlglot
-from sqlglot.lineage import lineage
+from sqlglot.errors import SqlglotError
+from sqlglot.lineage import DMLLineage, WriteKind, dml_lineage, lineage
 from sqlglot.schema import MappingSchema
+
+try:
+    import duckdb
+except ImportError:
+    duckdb = None
 
 
 class TestLineage(unittest.TestCase):
@@ -1299,3 +1305,303 @@ class TestLineage(unittest.TestCase):
                 seen.add(id(node))
         for nid in seen:
             self.assertEqual(counts.get(nid, 0), 1)
+
+
+class TestDMLLineage(unittest.TestCase):
+    maxDiff = None
+
+    @classmethod
+    def setUpClass(cls):
+        sqlglot.schema = MappingSchema()
+
+    SCHEMA = {
+        "t": {"id": "int", "a": "int", "b": "int"},
+        "s": {"id": "int", "x": "int", "y": "int", "flag": "int"},
+        "s2": {"id": "int", "x": "int"},
+    }
+
+    @staticmethod
+    def leaf_names(node):
+        return sorted({n.name for n in node.walk() if n is not node and not n.downstream})
+
+    def test_insert_select(self) -> None:
+        result = dml_lineage(
+            "INSERT INTO t (id, a) SELECT id, x FROM s", schema=self.SCHEMA, dialect="postgres"
+        )
+        self.assertIsInstance(result, DMLLineage)
+        self.assertEqual(result.target, "t")
+        self.assertEqual(len(result.branches), 1)
+
+        branch = result.branches[0]
+        self.assertEqual(branch.action, "INSERT")
+        self.assertIsNone(branch.condition)
+        self.assertEqual(set(branch.columns), {"id", "a"})
+        self.assertEqual(branch.columns["id"].kind, WriteKind.EXPRESSION)
+        self.assertEqual(self.leaf_names(branch.columns["id"]), ["s.id"])
+        self.assertEqual(self.leaf_names(branch.columns["a"]), ["s.x"])
+
+    def test_insert_select_schema_columns_and_star(self) -> None:
+        # No column list: the target columns come from the schema, in order
+        result = dml_lineage(
+            "INSERT INTO t SELECT * FROM st",
+            schema={**self.SCHEMA, "st": {"id": "int", "x": "int", "y": "int"}},
+            dialect="postgres",
+        )
+        branch = result.branches[0]
+        self.assertEqual(list(branch.columns), ["id", "a", "b"])
+        self.assertEqual(self.leaf_names(branch.columns["id"]), ["st.id"])
+        self.assertEqual(self.leaf_names(branch.columns["a"]), ["st.x"])
+        self.assertEqual(self.leaf_names(branch.columns["b"]), ["st.y"])
+
+        # Constants in the source query are not expressions
+        result = dml_lineage(
+            "INSERT INTO t (id, a) SELECT 1, x FROM s", schema=self.SCHEMA, dialect="postgres"
+        )
+        branch = result.branches[0]
+        self.assertEqual(branch.columns["id"].kind, WriteKind.CONSTANT)
+        self.assertEqual(branch.columns["id"].downstream, [])
+        self.assertEqual(branch.columns["a"].kind, WriteKind.EXPRESSION)
+
+    def test_insert_values(self) -> None:
+        result = dml_lineage(
+            "INSERT INTO t (id, a, b) VALUES (1, DEFAULT, 2), (3, 4, 5)",
+            schema=self.SCHEMA,
+            dialect="postgres",
+        )
+        branch = result.branches[0]
+        self.assertEqual(set(branch.columns), {"id", "a", "b"})
+
+        for node in branch.columns.values():
+            self.assertEqual(node.kind, WriteKind.VALUES)
+            self.assertEqual(len(node.downstream), 2)
+
+        self.assertEqual(
+            [n.kind for n in branch.columns["id"].downstream],
+            [WriteKind.CONSTANT, WriteKind.CONSTANT],
+        )
+        self.assertEqual(
+            [n.kind for n in branch.columns["a"].downstream],
+            [WriteKind.DEFAULT, WriteKind.CONSTANT],
+        )
+
+    def test_insert_default_values(self) -> None:
+        result = dml_lineage("INSERT INTO t DEFAULT VALUES", schema=self.SCHEMA, dialect="postgres")
+        branch = result.branches[0]
+        self.assertEqual(set(branch.columns), {"id", "a", "b"})
+        for node in branch.columns.values():
+            self.assertEqual(node.kind, WriteKind.DEFAULT)
+
+    def test_insert_errors(self) -> None:
+        # Column count mismatch between the target list and the source query
+        with self.assertRaises(SqlglotError) as ctx:
+            dml_lineage(
+                "INSERT INTO t (id, a) SELECT id FROM s", schema=self.SCHEMA, dialect="postgres"
+            )
+        self.assertIn("Column count mismatch", str(ctx.exception))
+        self.assertIn("t", str(ctx.exception))
+
+        # Column count mismatch in a VALUES row
+        with self.assertRaises(SqlglotError) as ctx:
+            dml_lineage(
+                "INSERT INTO t (id, a) VALUES (1, 2, 3)", schema=self.SCHEMA, dialect="postgres"
+            )
+        self.assertIn("Column count mismatch", str(ctx.exception))
+
+        # No column list and the target table is not in the schema
+        with self.assertRaises(SqlglotError) as ctx:
+            dml_lineage(
+                "INSERT INTO t SELECT * FROM s", schema={"s": self.SCHEMA["s"]}, dialect="postgres"
+            )
+        self.assertIn("target columns", str(ctx.exception))
+
+        # The star cannot be expanded without a schema for the source
+        with self.assertRaises(SqlglotError) as ctx:
+            dml_lineage(
+                "INSERT INTO t SELECT * FROM s", schema={"t": self.SCHEMA["t"]}, dialect="postgres"
+            )
+        self.assertIn("'*'", str(ctx.exception))
+
+        # Not a DML statement
+        with self.assertRaises(SqlglotError):
+            dml_lineage("SELECT * FROM s", schema=self.SCHEMA, dialect="postgres")
+
+    def test_update_swap_columns(self) -> None:
+        # Each assignment reads the pre-update row: a <- old b, b <- old a.
+        # The first SET must not become the source of the second.
+        result = dml_lineage("UPDATE t SET a = b, b = a", schema=self.SCHEMA, dialect="postgres")
+        branch = result.branches[0]
+        self.assertEqual(branch.action, "UPDATE")
+        self.assertEqual(self.leaf_names(branch.columns["a"]), ["t.b"])
+        self.assertEqual(self.leaf_names(branch.columns["b"]), ["t.a"])
+
+        # Untouched target columns keep their old values
+        self.assertEqual(branch.columns["id"].kind, WriteKind.RETAINED)
+
+    def test_update_from(self) -> None:
+        result = dml_lineage(
+            "UPDATE t SET a = s.x, b = a + 1 FROM s WHERE t.id = s.id",
+            schema=self.SCHEMA,
+            dialect="postgres",
+        )
+        branch = result.branches[0]
+        self.assertEqual(branch.condition.sql(), "t.id = s.id")
+        self.assertEqual(self.leaf_names(branch.columns["a"]), ["s.x"])
+
+        # The unqualified reference reads the pre-update target row, not the
+        # column assigned by the previous SET
+        self.assertEqual(self.leaf_names(branch.columns["b"]), ["t.a"])
+        self.assertEqual(branch.columns["id"].kind, WriteKind.RETAINED)
+
+        # Joins in the FROM clause
+        result = dml_lineage(
+            "UPDATE t SET a = s.x + s2.x FROM s JOIN s2 ON s.id = s2.id WHERE t.id = s.id",
+            schema=self.SCHEMA,
+            dialect="postgres",
+        )
+        self.assertEqual(self.leaf_names(result.branches[0].columns["a"]), ["s.x", "s2.x"])
+
+    def test_update_default_and_constant(self) -> None:
+        result = dml_lineage(
+            "UPDATE t SET a = DEFAULT, b = 0", schema=self.SCHEMA, dialect="postgres"
+        )
+        branch = result.branches[0]
+        self.assertEqual(branch.columns["a"].kind, WriteKind.DEFAULT)
+        self.assertEqual(branch.columns["b"].kind, WriteKind.CONSTANT)
+        self.assertEqual(branch.columns["id"].kind, WriteKind.RETAINED)
+
+    def test_merge(self) -> None:
+        result = dml_lineage(
+            "MERGE INTO t USING s ON t.id = s.id "
+            "WHEN MATCHED AND s.flag = 1 THEN UPDATE SET a = s.x "
+            "WHEN NOT MATCHED THEN INSERT (id, a, b) VALUES (s.id, s.y, 0) "
+            "WHEN NOT MATCHED BY SOURCE THEN DELETE",
+            schema=self.SCHEMA,
+            dialect="postgres",
+        )
+        self.assertEqual(result.target, "t")
+        self.assertEqual(result.on.sql(), "t.id = s.id")
+        self.assertEqual([b.action for b in result.branches], ["UPDATE", "INSERT", "DELETE"])
+        self.assertEqual([b.matched for b in result.branches], [True, False, False])
+        self.assertEqual([b.source for b in result.branches], [False, False, True])
+
+        update, insert, delete = result.branches
+
+        # The WHEN condition is a control dependency of the branch, kept apart
+        # from the column value sources
+        self.assertEqual(update.condition.sql(), "s.flag = 1")
+        self.assertEqual(self.leaf_names(update.columns["a"]), ["s.x"])
+        self.assertEqual(update.columns["id"].kind, WriteKind.RETAINED)
+        self.assertEqual(update.columns["b"].kind, WriteKind.RETAINED)
+
+        self.assertIsNone(insert.condition)
+        self.assertEqual(self.leaf_names(insert.columns["id"]), ["s.id"])
+        self.assertEqual(self.leaf_names(insert.columns["a"]), ["s.y"])
+        self.assertEqual(insert.columns["b"].kind, WriteKind.CONSTANT)
+
+        self.assertEqual(delete.columns, {})
+
+        # Control dependencies never leak into the value sources
+        for node in result.walk():
+            self.assertNotIn("flag", node.name)
+
+    def test_merge_insert_schema_columns(self) -> None:
+        # No column list on the INSERT branch: columns come from the schema
+        result = dml_lineage(
+            "MERGE INTO t USING s ON t.id = s.id "
+            "WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.x, 0)",
+            schema=self.SCHEMA,
+            dialect="postgres",
+        )
+        branch = result.branches[0]
+        self.assertEqual(list(branch.columns), ["id", "a", "b"])
+
+        with self.assertRaises(SqlglotError) as ctx:
+            dml_lineage(
+                "MERGE INTO t USING s ON t.id = s.id "
+                "WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id, s.x)",
+                schema=self.SCHEMA,
+                dialect="postgres",
+            )
+        self.assertIn("Column count mismatch", str(ctx.exception))
+
+    def test_dml_cte_union_subquery_and_shadowing(self) -> None:
+        # CTEs and UNIONs are traced through; every UNION branch contributes
+        result = dml_lineage(
+            "WITH c AS (SELECT id, x FROM s2) INSERT INTO t (id, a) "
+            "SELECT c.id, c.x FROM c UNION ALL SELECT id, x FROM s",
+            schema=self.SCHEMA,
+            dialect="postgres",
+        )
+        branch = result.branches[0]
+        self.assertEqual(self.leaf_names(branch.columns["id"]), ["s.id", "s2.id"])
+        self.assertEqual(self.leaf_names(branch.columns["a"]), ["s.x", "s2.x"])
+
+        # A CTE shadows the physical table of the same name
+        result = dml_lineage(
+            "WITH s AS (SELECT id, x FROM s2) UPDATE t SET a = s.x FROM s WHERE t.id = s.id",
+            schema=self.SCHEMA,
+            dialect="postgres",
+        )
+        self.assertEqual(self.leaf_names(result.branches[0].columns["a"]), ["s2.x"])
+
+        # Derived tables and correlated subqueries
+        result = dml_lineage(
+            "UPDATE t SET a = q.x FROM (SELECT x, id FROM s) AS q WHERE t.id = q.id",
+            schema=self.SCHEMA,
+            dialect="postgres",
+        )
+        self.assertEqual(self.leaf_names(result.branches[0].columns["a"]), ["s.x"])
+
+        result = dml_lineage(
+            "UPDATE t SET a = (SELECT MAX(x) FROM s WHERE s.id = t.id)",
+            schema=self.SCHEMA,
+            dialect="postgres",
+        )
+        self.assertEqual(self.leaf_names(result.branches[0].columns["a"]), ["s.x"])
+
+    def test_dml_lineage_on_node(self) -> None:
+        nodes = []
+        dml_lineage(
+            "UPDATE t SET a = b", schema=self.SCHEMA, dialect="postgres", on_node=nodes.append
+        )
+        self.assertGreater(len(nodes), 0)
+        self.assertEqual(len({id(n) for n in nodes}), len(nodes))
+
+    @unittest.skipUnless(duckdb, "duckdb is not installed")
+    def test_dml_lineage_duckdb_writes(self) -> None:
+        # The graph's target columns are checked against what DuckDB actually writes.
+        # (DuckDB has no MERGE support, so the executable checks cover UPDATE and
+        # INSERT ... SELECT; MERGE branches are verified structurally above.)
+        conn = duckdb.connect()
+        conn.execute("CREATE TABLE t (id INT, a INT, b INT)")
+        conn.execute("INSERT INTO t VALUES (1, 10, 100), (2, 20, 200)")
+        conn.execute("CREATE TABLE s (id INT, x INT, y INT, flag INT)")
+        conn.execute("INSERT INTO s VALUES (1, 7, 70, 1), (3, 9, 90, 0)")
+
+        # UPDATE swapping two columns: the graph says a <- old b and b <- old a
+        sql = "UPDATE t SET a = b, b = a"
+        result = dml_lineage(sql, schema=self.SCHEMA, dialect="duckdb")
+        branch = result.branches[0]
+        self.assertEqual(self.leaf_names(branch.columns["a"]), ["t.b"])
+        self.assertEqual(self.leaf_names(branch.columns["b"]), ["t.a"])
+        self.assertEqual(branch.columns["id"].kind, WriteKind.RETAINED)
+
+        before = {row[0]: row for row in conn.execute("SELECT id, a, b FROM t").fetchall()}
+        conn.execute(sql)
+        for id_, a, b in conn.execute("SELECT id, a, b FROM t").fetchall():
+            self.assertEqual(a, before[id_][2])
+            self.assertEqual(b, before[id_][1])
+
+        # INSERT ... SELECT: the graph maps target columns to the source columns
+        # whose values DuckDB writes
+        sql = "INSERT INTO t (id, a) SELECT id, x FROM s WHERE flag = 1"
+        result = dml_lineage(sql, schema=self.SCHEMA, dialect="duckdb")
+        branch = result.branches[0]
+        self.assertEqual(self.leaf_names(branch.columns["id"]), ["s.id"])
+        self.assertEqual(self.leaf_names(branch.columns["a"]), ["s.x"])
+
+        conn.execute(sql)
+        self.assertEqual(
+            conn.execute("SELECT id, a, b FROM t WHERE id = 1 AND a = 7").fetchall(),
+            [(1, 7, None)],
+        )
