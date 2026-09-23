@@ -53,6 +53,17 @@ from sqlglot.generator import Generator as Generator
 from sqlglot.parser import Parser as Parser
 from sqlglot.schema import MappingSchema as MappingSchema, Schema as Schema
 from sqlglot.tokens import Token as Token, Tokenizer as Tokenizer, TokenType as TokenType
+from sqlglot.analysis import (
+    analyze_script as analyze_script,
+    CatalogChange as CatalogChange,
+    CatalogSnapshot as CatalogSnapshot,
+    ColumnInfo as ColumnInfo,
+    ScriptAnalysis as ScriptAnalysis,
+    ScriptAnalyzer as ScriptAnalyzer,
+    ScriptDiagnostic as ScriptDiagnostic,
+    ScriptStatement as ScriptStatement,
+    TableName as TableName,
+)
 
 if t.TYPE_CHECKING:
     from sqlglot._typing import E, GeneratorArgs, ParserNoDialectArgs
