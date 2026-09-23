@@ -15,6 +15,11 @@ import typing as t
 
 from sqlglot import expressions as exp
 from sqlglot.dialects.dialect import Dialect as Dialect, Dialects as Dialects
+from sqlglot.changeset import (
+    ChangesetConflict as ChangesetConflict,
+    apply_changeset as apply_changeset,
+    diff_changeset as diff_changeset,
+)
 from sqlglot.diff import diff as diff
 from sqlglot.errors import (
     ErrorLevel as ErrorLevel,
