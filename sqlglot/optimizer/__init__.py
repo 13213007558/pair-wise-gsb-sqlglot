@@ -23,6 +23,11 @@ _import_lock = threading.RLock()
 
 # Only for type checkers and IDEs; runtime resolution goes through __getattr__.
 if t.TYPE_CHECKING:
+    from sqlglot.optimizer.nullability import (
+        ColumnNullability as ColumnNullability,
+        Nullability as Nullability,
+        infer_nullability as infer_nullability,
+    )
     from sqlglot.optimizer.optimizer import RULES as RULES, optimize as optimize
     from sqlglot.optimizer.scope import (
         Scope as Scope,
@@ -36,6 +41,9 @@ if t.TYPE_CHECKING:
 # Explicit, because some names collide between optimizer.py and submodules
 # (e.g. `qualify` is both a function and a submodule).
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
+    "ColumnNullability": ("sqlglot.optimizer.nullability", "ColumnNullability"),
+    "Nullability": ("sqlglot.optimizer.nullability", "Nullability"),
+    "infer_nullability": ("sqlglot.optimizer.nullability", "infer_nullability"),
     "RULES": ("sqlglot.optimizer.optimizer", "RULES"),
     "optimize": ("sqlglot.optimizer.optimizer", "optimize"),
     "Scope": ("sqlglot.optimizer.scope", "Scope"),
